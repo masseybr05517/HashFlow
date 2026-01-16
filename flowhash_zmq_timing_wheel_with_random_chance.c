@@ -262,6 +262,15 @@
    k.proto = proto;
    return k;
  }
+ static inline uint32_t rng32(void) {
+  g_rng ^= g_rng << 13;
+  g_rng ^= g_rng >> 17;
+  g_rng ^= g_rng << 5;
+  return g_rng;
+ }
+ static inline int coin50(void) {
+  return (int)(rng32() & 1u); // 50/50
+ }
  
  static int find_bucket(const flow_key_t *key, uint32_t h, int *found) {
     uint32_t p = h & (TABLE_SIZE - 1);
@@ -463,15 +472,6 @@ static void write_to_csv(flow_entry_t *e)
    return 1;
  }
  
- static inline uint32_t rng32(void) {
-  g_rng ^= g_rng << 13;
-  g_rng ^= g_rng >> 17;
-  g_rng ^= g_rng << 5;
-  return g_rng;
- }
- static inline int coin50(void) {
-  return (int)(rng32() & 1u); // 50/50
- }
  /* ================================================================= */
  /*                                main                               */
  /* ================================================================= */
