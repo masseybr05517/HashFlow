@@ -264,7 +264,6 @@
  }
  
  static int find_bucket(const flow_key_t *key, uint32_t h, int *found) {
-    static int find_bucket(const flow_key_t *key, uint32_t h, int *found) {
     uint32_t p = h & (TABLE_SIZE - 1);
 
     if (!table[p].in_use) { *found = 0; return (int)p; }
@@ -277,10 +276,10 @@
     // coin says "evict incumbent": caller will reuse p
     *found = 0;
     return (int)p;
- }
+}
 
 static void write_to_csv(flow_entry_t *e)
-{
+    {
     if (e->count == FLOW_CAP) {
         char ip_small[INET_ADDRSTRLEN], ip_large[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &e->key.ip1, ip_small, sizeof(ip_small));
