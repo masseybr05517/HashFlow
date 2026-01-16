@@ -10,7 +10,9 @@
  *    gcc flowhash_zmq_timing_wheel.c -std=c11 -O2 -Wall -pthread -lpcap \
  *        $(pkg-config --cflags --libs jansson libzmq) -o flowhash_zmq_timing_wheel
  *********************************************************************/
-
+ #define _DEFAULT_SOURCE
+ #define __FAVOR_BSD
+ #include <sys/types.h>
  #include <arpa/inet.h>
  #include <inttypes.h>
  #include <jansson.h>
