@@ -192,41 +192,78 @@
    pthread_mutex_unlock(&mtx);
  }
  
- static void *sender_thread(void *arg) {
-   void *ctx = zmq_ctx_new();
-   void *sock = zmq_socket(ctx, ZMQ_PUSH);
-   zmq_bind(sock, "ipc:///tmp/flowpipe");
- 
-   while (1) {
-     pthread_mutex_lock(&mtx);
-     while (fill < BATCH_SIZE && !exiting) pthread_cond_wait(&cond_full, &mtx);
- 
-     json_t *batch = json_array();
-     int sent = 0;
-     while (fill && sent < BATCH_SIZE) {
-       buf_item_t item = flow_buf[tail];
-       tail = (tail + 1) % BUF_MAX;
-       fill--;
-       sent++;
- 
-       json_t *obj = json_from_entry(&item.slot);
-       json_array_append_new(batch, obj);
-     }
-     pthread_mutex_unlock(&mtx);
- 
-     if (json_array_size(batch) > 0) {
-       char *txt = json_dumps(batch, JSON_COMPACT);
-       zmq_send(sock, txt, strlen(txt), 0);
-       free(txt);
-     }
-     json_decref(batch);
- 
-     if (exiting && fill == 0) break;
-   }
-   zmq_close(sock);
-   zmq_ctx_term(ctx);
-   return NULL;
- }
+static void *sender_thread(void *arg) {
+  (void)arg;
+
+  void *ctx = zmq_ctx_new();
+  if (!ctx) return NULL;
+
+  void *sock = zmq_socket(ctx, ZMQ_PUSH);
+  if (!sock) {
+    zmq_ctx_term(ctx);
+    return NULL;
+  }
+
+  /* ---- prevent "hang on exit" / "hang on send" ---- */
+  int linger = 0;                 /* don't wait on close */
+  zmq_setsockopt(sock, ZMQ_LINGER, &linger, sizeof(linger));
+
+  int sndtimeo = 1000;            /* 1s max block on send (backup safety) */
+  zmq_setsockopt(sock, ZMQ_SNDTIMEO, &sndtimeo, sizeof(sndtimeo));
+
+  int sndhwm = 1000;              /* cap outbound queue */
+  zmq_setsockopt(sock, ZMQ_SNDHWM, &sndhwm, sizeof(sndhwm));
+
+  if (zmq_bind(sock, "ipc:///tmp/flowpipe") != 0) {
+    zmq_close(sock);
+    zmq_ctx_term(ctx);
+    return NULL;
+  }
+
+  while (1) {
+    pthread_mutex_lock(&mtx);
+    while (fill < BATCH_SIZE && !exiting) {
+      pthread_cond_wait(&cond_full, &mtx);
+    }
+
+    json_t *batch = json_array();
+    int sent = 0;
+
+    while (fill && sent < BATCH_SIZE) {
+      buf_item_t item = flow_buf[tail];
+      tail = (tail + 1) % BUF_MAX;
+      fill--;
+      sent++;
+
+      json_t *obj = json_from_entry(&item.slot);
+      json_array_append_new(batch, obj);
+    }
+    pthread_mutex_unlock(&mtx);
+
+    if (json_array_size(batch) > 0) {
+      char *txt = json_dumps(batch, JSON_COMPACT);
+      if (txt) {
+        /* Non-blocking send; drop batch if no receiver / queue full */
+        int rc = zmq_send(sock, txt, strlen(txt), ZMQ_DONTWAIT);
+        (void)rc; /* optionally: if (rc == -1) count drops */
+        free(txt);
+      }
+    }
+    json_decref(batch);
+
+    if (exiting) {
+      pthread_mutex_lock(&mtx);
+      int done = (fill == 0);
+      pthread_mutex_unlock(&mtx);
+      if (done) break;
+    }
+  }
+
+  zmq_close(sock);
+  zmq_ctx_term(ctx);
+  return NULL;
+}
+
  
  /* ================================================================= */
  /*                         helper functions                           */
