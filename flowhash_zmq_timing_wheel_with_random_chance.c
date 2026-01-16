@@ -389,7 +389,6 @@ static void write_to_csv(flow_entry_t *e)
    int found;
    int idx = find_bucket(&key, h, &found);
    if (idx < 0) {
-     fprintf(stderr, "Hash-table full!\n");
      return;
    }
  
