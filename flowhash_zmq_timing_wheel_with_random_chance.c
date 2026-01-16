@@ -85,6 +85,7 @@
  static time_t tw_now_sec = 0;
  static int tw_now_slot = 0;
  static int tw_initialised = 0;
+ static time_t last_pcap_sec = 0;
  static inline int idx_of(flow_entry_t *e) { return (int)(e - table); }
  
  /* ---------- ZMQ batching buffer ---------------------------------- */
@@ -465,7 +466,7 @@ static void write_to_csv(flow_entry_t *e)
      dport = ntohs(uh->uh_dport);
    } else
      return 0;
- 
+   last_pcap_sec = h->ts.tv_sec;
    track_packet(&h->ts, sip, dip, sport, dport, proto, syn, fin,
                 ntohs(ip->ip_len));
    return 1;
@@ -511,7 +512,8 @@ static void write_to_csv(flow_entry_t *e)
    /* final flush: advance far enough to expire everything */
    struct timeval tv;
    gettimeofday(&tv, NULL);
-   tw_advance(tv.tv_sec + UDP_IDLE_SEC + TW_SLOTS);
+   //tw_advance(tv.tv_sec + UDP_IDLE_SEC + TW_SLOTS); #previous advancement
+   tw_advance(last_pcap_sec + UDP_IDLE_SEC + TW_SLOTS);
  
    for (int i = 0; i < TABLE_SIZE; ++i)
      if (table[i].in_use) dump_and_clear(&table[i]);
