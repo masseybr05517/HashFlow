@@ -301,6 +301,7 @@ def evaluate_model(name: str, model, X_train, y_train, X_test, y_test) -> None:
     print(f"Precision@0.5: {precision:.4f}")
     print(f"Recall@0.5:    {recall:.4f}")
     print(f"F1@0.5:        {f1:.4f}")
+    return model
 
 def main():
     ap = argparse.ArgumentParser()
