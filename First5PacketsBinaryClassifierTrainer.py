@@ -14,6 +14,7 @@ predict whether the bidirectional flow will reach >= 40 packets total.
 import argparse
 import glob
 import os
+import ipaddress
 import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -50,6 +51,13 @@ def canonical_flow_key(src_ip: str, src_port: int, dst_ip: str, dst_port: int, p
         A, B = b, a
     return (A[0], A[1], B[0], B[1], str(proto))
 
+def is_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(str(s).strip())
+        return True
+    except Exception:
+        return False
+
 
 def _to_float(x) -> Optional[float]:
     """Convert CSV cell to float, returning None if blank/NaN/unparseable."""
@@ -66,23 +74,37 @@ def _to_float(x) -> Optional[float]:
         return None
 
 
-def parse_row_to_events(row: List, ts_start_idx: int = 6) -> Optional[Tuple[FlowKey, List[Tuple[float, float]]]]:
-    """
-    Returns:
-      (canonical_flow_key, [(timestamp, size), ...]) for this unidirectional row
-    or None if row cannot be parsed.
-    """
-    if len(row) < ts_start_idx + 3:
+def parse_row_to_events(row: List, ts_start_guess: int = 6):
+    if len(row) < 10:
         return None
 
-    label = str(row[0]).strip()  # not used for target, but you may want it later
-    src_ip = str(row[1]).strip()
-    src_port = row[2]
-    dst_ip = str(row[3]).strip()
-    dst_port = row[4]
-    proto = str(row[5]).strip()
+    # Find where the src_ip actually starts (handles 1-label or 2-label files)
+    ip_idx = None
+    for i in range(min(10, len(row))):  # IP should be early; scan first 10 cells
+        if is_ip(row[i]):
+            ip_idx = i
+            break
+    if ip_idx is None:
+        return None
 
-    key = canonical_flow_key(src_ip, int(src_port), dst_ip, int(dst_port), proto)
+    # Now parse 5-tuple relative to that position
+    src_ip = str(row[ip_idx]).strip()
+    src_port = row[ip_idx + 1]
+    dst_ip = str(row[ip_idx + 2]).strip()
+    dst_port = row[ip_idx + 3]
+    proto = str(row[ip_idx + 4]).strip()
+
+    # validate ports
+    try:
+        src_port = int(str(src_port).strip())
+        dst_port = int(str(dst_port).strip())
+    except ValueError:
+        return None
+
+    key = canonical_flow_key(src_ip, src_port, dst_ip, dst_port, proto)
+
+    # timestamps start right after proto
+    ts_start_idx = ip_idx + 5
 
     # Find blank separator column between timestamps and sizes.
     # We scan from ts_start_idx onward for the first truly blank cell.
