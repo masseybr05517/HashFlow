@@ -41,6 +41,7 @@ from sklearn.ensemble import RandomForestClassifier
 
 Endpoint = Tuple[str, int]
 FlowKey = Tuple[str, int, str, int, str]  # (A_ip, A_port, B_ip, B_port, proto)
+FIRST_N_PACKETS = 5
 
 def canonical_flow_key(src_ip: str, src_port: int, dst_ip: str, dst_port: int, proto: str) -> FlowKey:
     a: Endpoint = (src_ip, int(src_port))
@@ -148,30 +149,25 @@ def parse_row_to_events(row: List, ts_start_guess: int = 6):
 # Feature extraction
 # -----------------------------
 
-def features_from_first5(events_sorted: List[Tuple[float, float]]) -> Optional[Dict[str, float]]:
-    """
-    events_sorted: list of (t, size) sorted by t, across BOTH directions
-    Produces features using the first 5 packets only (ignoring direction).
-    """
-    if len(events_sorted) < 5:
+def features_from_firstN(events_sorted, N=FIRST_N_PACKETS):
+    if len(events_sorted) < N:
         return None
 
-    first5 = events_sorted[:5]
-    t = np.array([x[0] for x in first5], dtype=float)
-    s = np.array([x[1] for x in first5], dtype=float)
+    firstN = events_sorted[:N]
+    t = np.array([x[0] for x in firstN], dtype=float)
+    s = np.array([x[1] for x in firstN], dtype=float)
 
-    # Ensure non-decreasing time; if ties exist, np.diff can be 0.
     dt = np.diff(t)
     span = t[-1] - t[0]
 
-    feats: Dict[str, float] = {}
+    feats = {}
 
     # raw sizes
-    for i in range(5):
+    for i in range(N):
         feats[f"s{i+1}"] = float(s[i])
 
-    # interarrival times (always >=0, direction ignored)
-    for i in range(4):
+    # interarrival times
+    for i in range(N - 1):
         feats[f"dt{i+2}"] = float(dt[i])
 
     # aggregate size stats
@@ -181,19 +177,19 @@ def features_from_first5(events_sorted: List[Tuple[float, float]]) -> Optional[D
     feats["max_size"] = float(np.max(s))
     feats["sum_size"] = float(np.sum(s))
 
-    # aggregate dt stats
+    # aggregate timing stats
     feats["mean_dt"] = float(np.mean(dt))
     feats["std_dt"] = float(np.std(dt))
     feats["min_dt"] = float(np.min(dt))
     feats["max_dt"] = float(np.max(dt))
-    feats["span_5"] = float(span)
+    feats[f"span_{N}"] = float(span)
 
-    # rates (avoid div-by-zero)
     eps = 1e-9
-    feats["pps_early"] = float(5.0 / (span + eps))
-    feats["bps_early"] = float(np.sum(s) / (span + eps))
+    feats[f"pps_{N}"] = float(N / (span + eps))
+    feats[f"bps_{N}"] = float(np.sum(s) / (span + eps))
 
     return feats
+
 
 
 # -----------------------------
@@ -238,7 +234,7 @@ def build_examples_from_csv(csv_path: str) -> List[Example]:
         events_sorted = sorted(events, key=lambda x: x[0])
         y = 1 if len(events_sorted) >= 40 else 0
 
-        feats = features_from_first5(events_sorted)
+        feats = features_from_firstN(events_sorted)
         if feats is None:
             continue
 
@@ -311,8 +307,10 @@ def main():
     ap.add_argument("--csv_glob", required=True, help='e.g. "data/*labeled*.csv"')
     ap.add_argument("--test_size", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=7)
-    args = ap.parse_args()
+    ap.add_argument("--first_n", type=int, default=5)
 
+    args = ap.parse_args()
+    FIRST_N_PACKETS = args.first_n
     X_df, y, groups = build_dataset(args.csv_glob)
 
     # --- ADD THIS: save feature order ---
@@ -350,12 +348,23 @@ def main():
     lr_trained = evaluate_model("LogisticRegression(balanced)", lr, X_train, y_train, X_test, y_test)
     rf_trained = evaluate_model("RandomForest(balanced_subsample)", rf, X_train, y_train, X_test, y_test)
 
-    # --- ADD THIS: save whichever model you want ---
-    joblib.dump(lr_trained, "logreg_first5.joblib")
-    print("Saved model to logreg_first5.joblib")
-    # ----------------------------------------------
-    joblib.dump(rf_trained, "randforest_first5.joblib")
-    print("Saved model to randforest_first5.joblib")
+    # --- SAVE MODELS WITH N IN FILENAME ---
+    lr_model_path = f"logreg_first{FIRST_N_PACKETS}.joblib"
+    rf_model_path = f"randforest_first{FIRST_N_PACKETS}.joblib"
+
+    joblib.dump(lr_trained, lr_model_path)
+    print(f"Saved model to {lr_model_path}")
+
+    joblib.dump(rf_trained, rf_model_path)
+    print(f"Saved model to {rf_model_path}")
+
+    # --- SAVE METADATA ---
+    metadata = {
+        "first_N_packets": FIRST_N_PACKETS,
+        "label": "bidirectional_packets >= 40"
+    }
+    joblib.dump(metadata, f"metadata_first{FIRST_N_PACKETS}.joblib")
+    print(f"Saved metadata to metadata_first{FIRST_N_PACKETS}.joblib")
 
 
 if __name__ == "__main__":
