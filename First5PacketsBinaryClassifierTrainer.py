@@ -206,7 +206,7 @@ class Example:
 import csv
 import os
 
-def build_examples_from_csv(csv_path: str, first_n: int) -> List[Example]:
+def build_examples_from_csv(csv_path: str, first_n: int, target_packets: int) -> List[Example]:
     by_key: Dict[FlowKey, List[Tuple[float, float]]] = {}
 
     with open(csv_path, "r", newline="") as f:
@@ -232,7 +232,7 @@ def build_examples_from_csv(csv_path: str, first_n: int) -> List[Example]:
 
     for key, events in by_key.items():
         events_sorted = sorted(events, key=lambda x: x[0])
-        y = 1 if len(events_sorted) >= 40 else 0
+        y = 1 if len(events_sorted) >= target_packets else 0
 
         feats = features_from_firstN(events_sorted, first_n)
         if feats is None:
@@ -244,7 +244,7 @@ def build_examples_from_csv(csv_path: str, first_n: int) -> List[Example]:
 
 
 
-def build_dataset(csv_glob: str, first_n: int) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+def build_dataset(csv_glob: str, first_n: int, target_packets: int) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     """
     Returns:
       X_df: dataframe of features
@@ -309,6 +309,9 @@ def main():
     ap.add_argument("--test_size", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--first_n", type=int, default=5)
+    ap.add_argument("--target_packets", type=int, default=40,
+                help="Label threshold: positive if total packets in bidirectional flow >= this value (default: 40)")
+
 
     args = ap.parse_args()
     FIRST_N_PACKETS = args.first_n
@@ -361,8 +364,9 @@ def main():
     # --- SAVE METADATA ---
     metadata = {
         "first_N_packets": FIRST_N_PACKETS,
-        "label": "bidirectional_packets >= 40"
+        "target_packets": args.target_packets
     }
+
     joblib.dump(metadata, f"metadata_first{FIRST_N_PACKETS}.joblib")
     print(f"Saved metadata to metadata_first{FIRST_N_PACKETS}.joblib")
 
