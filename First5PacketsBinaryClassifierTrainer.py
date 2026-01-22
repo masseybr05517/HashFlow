@@ -33,7 +33,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-
+import joblib
 
 # -----------------------------
 # Helpers: canonical key & parsing
@@ -41,7 +41,7 @@ from sklearn.ensemble import RandomForestClassifier
 
 Endpoint = Tuple[str, int]
 FlowKey = Tuple[str, int, str, int, str]  # (A_ip, A_port, B_ip, B_port, proto)
-FIRST_N_PACKETS = 5
+
 
 def canonical_flow_key(src_ip: str, src_port: int, dst_ip: str, dst_port: int, proto: str) -> FlowKey:
     a: Endpoint = (src_ip, int(src_port))
@@ -149,7 +149,7 @@ def parse_row_to_events(row: List, ts_start_guess: int = 6):
 # Feature extraction
 # -----------------------------
 
-def features_from_firstN(events_sorted, N=FIRST_N_PACKETS):
+def features_from_firstN(events_sorted, N):
     if len(events_sorted) < N:
         return None
 
@@ -206,7 +206,7 @@ class Example:
 import csv
 import os
 
-def build_examples_from_csv(csv_path: str) -> List[Example]:
+def build_examples_from_csv(csv_path: str, first_n: int) -> List[Example]:
     by_key: Dict[FlowKey, List[Tuple[float, float]]] = {}
 
     with open(csv_path, "r", newline="") as f:
@@ -244,7 +244,7 @@ def build_examples_from_csv(csv_path: str) -> List[Example]:
 
 
 
-def build_dataset(csv_glob: str) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+def build_dataset(csv_glob: str, first_n: int) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     """
     Returns:
       X_df: dataframe of features
@@ -257,7 +257,7 @@ def build_dataset(csv_glob: str) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
 
     all_examples: List[Example] = []
     for p in paths:
-        all_examples.extend(build_examples_from_csv(p))
+        all_examples.extend(build_examples_from_csv(p, first_n))
 
     if not all_examples:
         raise RuntimeError("No examples built. Check parsing or CSV format.")
@@ -310,11 +310,10 @@ def main():
     ap.add_argument("--first_n", type=int, default=5)
 
     args = ap.parse_args()
-    FIRST_N_PACKETS = args.first_n
-    X_df, y, groups = build_dataset(args.csv_glob)
+    
+    X_df, y, groups = build_dataset(args.csv_glob, args.first_n)
 
     # --- ADD THIS: save feature order ---
-    import joblib
     feature_names = list(X_df.columns)
     joblib.dump(feature_names, "feature_names.joblib")
     print("Saved feature names to feature_names.joblib")
