@@ -227,7 +227,7 @@ def build_dataset(csv_glob: str) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
       y: labels
       groups: group ids (e.g., file) for splitting
     """
-    paths = sorted(glob.glob(csv_glob))
+    paths = sorted(glob.glob(csv_glob, recursive=True))
     if not paths:
         raise FileNotFoundError(f"No CSVs matched: {csv_glob}")
 
