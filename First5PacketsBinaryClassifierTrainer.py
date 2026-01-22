@@ -310,7 +310,7 @@ def main():
     ap.add_argument("--first_n", type=int, default=5)
 
     args = ap.parse_args()
-    
+    FIRST_N_PACKETS = args.first_n
     X_df, y, groups = build_dataset(args.csv_glob, args.first_n)
 
     # --- ADD THIS: save feature order ---
