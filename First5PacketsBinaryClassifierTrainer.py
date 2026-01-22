@@ -234,7 +234,7 @@ def build_examples_from_csv(csv_path: str, first_n: int) -> List[Example]:
         events_sorted = sorted(events, key=lambda x: x[0])
         y = 1 if len(events_sorted) >= 40 else 0
 
-        feats = features_from_firstN(events_sorted)
+        feats = features_from_firstN(events_sorted, first_n)
         if feats is None:
             continue
 
