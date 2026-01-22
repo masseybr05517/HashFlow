@@ -1,10 +1,15 @@
 import joblib
-import m2cgen as m2c
+import treelite
+import treelite.sklearn
 
 rf = joblib.load("randforest_first8.joblib")
-print("Loaded object type:", type(rf))
-print("Loaded object repr:", rf)
-c_code = m2c.export_to_c(rf)
+tl = treelite.sklearn.import_model(rf)
 
-with open("rf_first8_model.c", "w") as f:
-    f.write(c_code)
+# Build a shared library you can link/use from C
+tl.export_lib(
+    libpath="rf_first8.so",
+    toolchain="gcc",
+    verbose=True
+)
+
+print("Built rf_first8.so")
