@@ -17,6 +17,7 @@ import os
 import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
+import csv
 
 import numpy as np
 import pandas as pd
@@ -186,34 +187,32 @@ class Example:
 
 def build_examples_from_csv(csv_path: str) -> List[Example]:
     """
-    Reads a CSV, combines bidirectional flows by canonical key,
-    builds one example per bidirectional flow.
+    Reads a CSV with VARIABLE number of columns per row.
+    Combines bidirectional flows by canonical key, builds one example per bidirectional flow.
     """
-    df = pd.read_csv(csv_path, header=None, dtype=object, keep_default_na=False)
-    rows = df.values.tolist()
-
-    # Accumulate events per bidirectional flow key
     by_key: Dict[FlowKey, List[Tuple[float, float]]] = {}
 
-    for row in rows:
-        parsed = parse_row_to_events(row)
-        if parsed is None:
-            continue
-        key, events = parsed
-        by_key.setdefault(key, []).extend(events)
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            # row is a List[str] and can be variable length per line
+            parsed = parse_row_to_events(row)
+            if parsed is None:
+                continue
+            key, events = parsed
+            by_key.setdefault(key, []).extend(events)
 
     examples: List[Example] = []
     group = os.path.basename(csv_path)
 
     for key, events in by_key.items():
-        # sort by timestamp across both directions
         events_sorted = sorted(events, key=lambda x: x[0])
         total_packets = len(events_sorted)
         y = 1 if total_packets >= 40 else 0
 
         feats = features_from_first5(events_sorted)
         if feats is None:
-            continue  # can't apply "first 5 packets" rule
+            continue
 
         examples.append(Example(feats=feats, y=y, group=group))
 
