@@ -257,7 +257,7 @@ def build_dataset(csv_glob: str, first_n: int, target_packets: int) -> Tuple[pd.
 
     all_examples: List[Example] = []
     for p in paths:
-        all_examples.extend(build_examples_from_csv(p, first_n))
+        all_examples.extend(build_examples_from_csv(p, first_n, target_packets))
 
     if not all_examples:
         raise RuntimeError("No examples built. Check parsing or CSV format.")
@@ -315,7 +315,7 @@ def main():
 
     args = ap.parse_args()
     FIRST_N_PACKETS = args.first_n
-    X_df, y, groups = build_dataset(args.csv_glob, args.first_n)
+    X_df, y, groups = build_dataset(args.csv_glob, args.first_n, args.target_packets)
 
     # --- ADD THIS: save feature order ---
     feature_names = list(X_df.columns)
@@ -351,12 +351,8 @@ def main():
     lr_trained = evaluate_model("LogisticRegression(balanced)", lr, X_train, y_train, X_test, y_test)
     rf_trained = evaluate_model("RandomForest(balanced_subsample)", rf, X_train, y_train, X_test, y_test)
 
-    # --- SAVE MODELS WITH N IN FILENAME ---
-    lr_model_path = f"logreg_first{FIRST_N_PACKETS}.joblib"
-    rf_model_path = f"randforest_first{FIRST_N_PACKETS}.joblib"
-
-    joblib.dump(lr_trained, lr_model_path)
-    print(f"Saved model to {lr_model_path}")
+    # --- SAVE MODEL WITH N IN FILENAME ---
+    rf_model_path = f"randforest_first{FIRST_N_PACKETS}_predicting{ap.target_packets}packets.joblib"
 
     joblib.dump(rf_trained, rf_model_path)
     print(f"Saved model to {rf_model_path}")
