@@ -352,7 +352,7 @@ def main():
     rf_trained = evaluate_model("RandomForest(balanced_subsample)", rf, X_train, y_train, X_test, y_test)
 
     # --- SAVE MODEL WITH N IN FILENAME ---
-    rf_model_path = f"randforest_first{FIRST_N_PACKETS}_predicting{ap.target_packets}packets.joblib"
+    rf_model_path = f"randforest_first{FIRST_N_PACKETS}_predicting{args.target_packets}packets.joblib"
 
     joblib.dump(rf_trained, rf_model_path)
     print(f"Saved model to {rf_model_path}")
