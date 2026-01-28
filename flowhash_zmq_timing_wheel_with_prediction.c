@@ -751,6 +751,17 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
 /*                parse Ethernet/IP/TCP/UDP & call tracker            */
 /* ================================================================= */
 static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
+
+  /* ---- DEBUG: detect large timestamp jumps ---- */
+  static time_t prev = 0;
+  if (prev && h->ts.tv_sec - prev > 10) {
+    fprintf(stderr, "TS JUMP %ld -> %ld (Δ=%ld)\n",
+            (long)prev,
+            (long)h->ts.tv_sec,
+            (long)(h->ts.tv_sec - prev));
+  }
+  prev = h->ts.tv_sec;
+  /* -------------------------------------------- */
   const struct ether_header *eth = (const struct ether_header *)pkt;
   if (ntohs(eth->ether_type) != ETHERTYPE_IP) return 0;
 
