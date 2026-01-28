@@ -447,7 +447,10 @@ static void tw_advance(time_t now_sec) {
   g_tw_now_arg = (sig_atomic_t)now_sec;
   if (!tw_initialised) tw_init(now_sec);
 
-  if (now_sec <= tw_now_sec) return;
+  if (now_sec <= tw_now_sec) {
+    g_in_tw = 0;
+    return;
+  }
 
   time_t delta = now_sec - tw_now_sec;
   if (delta > 10) {
