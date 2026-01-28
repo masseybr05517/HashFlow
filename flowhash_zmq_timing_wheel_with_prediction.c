@@ -784,18 +784,20 @@ int main(int argc, char **argv) {
   srand((unsigned)time(NULL));
 
   char err[PCAP_ERRBUF_SIZE];
+  fprintf(stderr, "main: starting\n");
   pcap_t *pc = pcap_open_offline(argv[1], err);
   if (!pc) {
     fprintf(stderr, "pcap_open: %s\n", err);
     return 1;
   }
-
+  fprintf(stderr, "main: pcap opened\n");
   /* start sender thread */
   if (pthread_create(&zmq_thread, NULL, sender_thread, NULL) != 0) {
     perror("pthread_create");
     pcap_close(pc);
     return 1;
   }
+  fprintf(stderr, "main: sender thread created\n");
 
   struct pcap_pkthdr *h;
   const u_char *pkt;
@@ -804,7 +806,9 @@ int main(int argc, char **argv) {
     if (rc == 0) continue;
     parse_and_track(h, pkt);
   }
+  
   if (rc == -1) fprintf(stderr, "pcap error: %s\n", pcap_geterr(pc));
+  fprintf(stderr, "main: pcap loop done rc=%d\n", rc);
 
   /* final flush: advance far enough to expire everything */
   if (last_pcap_sec != 0) {
@@ -825,7 +829,7 @@ int main(int argc, char **argv) {
   exiting = 1;
   pthread_cond_broadcast(&cond_full);
   pthread_mutex_unlock(&mtx);
-  fprintf(stderr, "main: joining sender (fill=%zu exiting=%d)\n", fill, exiting);
+  fprintf(stderr, "main: setting exiting=1 and joining sender (fill=%zu)\n", fill);
   pthread_join(zmq_thread, NULL);
 
   pcap_close(pc);
