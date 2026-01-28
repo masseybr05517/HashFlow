@@ -35,7 +35,7 @@
 #include <zmq.h>
 
 /* tl2cgen header */
-#include "rf_first8_40packets_build/header.h"
+#include "../rf_first8_40packets_build/header.h"
 
 /* ---------- parameters ------------------------------------------- */
 #define TABLE_SIZE (65536 * 2) /* must be power of 2 */
@@ -45,7 +45,7 @@
 #define TW_SLOTS 256           /* must be power of 2 */
 #define BUF_MAX 64             /* ring buffer slots  */
 #define BATCH_SIZE 16          /* flows per JSON msg */
-#define SHOW_OUTPUT 1          /* stderr debug prints */
+#define SHOW_OUTPUT 0          /* stderr debug prints */
 #define WRITE_TO_CSV 1
 
 /* ML gate */
@@ -802,10 +802,30 @@ int main(int argc, char **argv) {
   struct pcap_pkthdr *h;
   const u_char *pkt;
   int rc;
+  uint64_t iters = 0, pkts = 0, zeros = 0;
+
   while ((rc = pcap_next_ex(pc, &h, &pkt)) >= 0) {
-    if (rc == 0) continue;
+  iters++;
+
+    if (rc == 0) {
+        zeros++;
+        if ((zeros % 100000ULL) == 0) {
+        fprintf(stderr, "pcap_next_ex: rc==0 zeros=%" PRIu64 " iters=%" PRIu64 "\n",
+                zeros, iters);
+        }
+        continue;
+    }
+
+    pkts++;
+    if ((pkts % 10000ULL) == 0) {
+        fprintf(stderr, "pcap: pkts=%" PRIu64 " iters=%" PRIu64 " last_ts=%ld\n",
+                pkts, iters, (long)h->ts.tv_sec);
+    }
+
     parse_and_track(h, pkt);
-  }
+    }
+
+
   
   if (rc == -1) fprintf(stderr, "pcap error: %s\n", pcap_geterr(pc));
   fprintf(stderr, "main: pcap loop done rc=%d\n", rc);
