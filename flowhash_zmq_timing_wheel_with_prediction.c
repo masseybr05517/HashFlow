@@ -744,21 +744,6 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
     else        tw_insert_generic(table, tw_head_main, (int)p, tv->tv_sec + UDP_IDLE_SEC);
   }
 
-  /* TCP FIN handling only affects MAIN flows (you asked to arbitrate who gets main) */
-  if (!is_aux && !e->is_udp) {
-    if (tcp_fin) {
-      if (sip == e->cli_ip && sport == e->cli_port) e->fin_cli_done = 1;
-      else e->fin_srv_done = 1;
-
-      /* original behavior: flush only when FIN+FIN AND count == FLOW_CAP */
-      if (e->fin_cli_done && e->fin_srv_done && e->count == FLOW_CAP) {
-        dump_and_clear_main(e);
-        /* if there was a contender, it remains in aux until it expires or is resolved later */
-        return;
-      }
-    }
-  }
-
   /* If main reaches FLOW_CAP, flush it (same behavior as original for “tracked flows”). */
   if (!is_aux && e->count == FLOW_CAP) {
     dump_and_clear_main(e);
