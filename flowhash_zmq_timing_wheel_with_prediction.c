@@ -416,32 +416,50 @@ static void drop_and_clear_aux(flow_entry_t *e) {
 /* ================================================================= */
 /*                 timing-wheel advance logic                         */
 /* ================================================================= */
+static void expire_slot_lists(int slot) {
+  /* expire main */
+  int idx = tw_head_main[slot];
+  tw_head_main[slot] = -1;
+  while (idx != -1) {
+    int nxt = table[idx].tw_next;
+    table[idx].tw_slot = table[idx].tw_next = -1;
+    dump_and_clear_main(&table[idx]);
+    idx = nxt;
+  }
+
+  /* expire aux */
+  idx = tw_head_aux[slot];
+  tw_head_aux[slot] = -1;
+  while (idx != -1) {
+    int nxt = aux[idx].tw_next;
+    aux[idx].tw_slot = aux[idx].tw_next = -1;
+    drop_and_clear_aux(&aux[idx]);
+    idx = nxt;
+  }
+}
+
 static void tw_advance(time_t now_sec) {
   if (!tw_initialised) tw_init(now_sec);
 
+  if (now_sec <= tw_now_sec) return;
+
+  time_t delta = now_sec - tw_now_sec;
+
+  /* BIG JUMP: if we jumped >= full wheel, everything expires */
+  if (delta >= TW_SLOTS) {
+    for (int s = 0; s < TW_SLOTS; ++s) {
+      expire_slot_lists(s);
+    }
+    tw_now_sec  = now_sec;
+    tw_now_slot = (int)(now_sec % TW_SLOTS);
+    return;
+  }
+
+  /* SMALL JUMP: step normally */
   while (tw_now_sec < now_sec) {
     tw_now_sec++;
     tw_now_slot = (tw_now_slot + 1) & (TW_SLOTS - 1);
-
-    /* expire main */
-    int idx = tw_head_main[tw_now_slot];
-    tw_head_main[tw_now_slot] = -1;
-    while (idx != -1) {
-      int nxt = table[idx].tw_next;
-      table[idx].tw_slot = table[idx].tw_next = -1;
-      dump_and_clear_main(&table[idx]);
-      idx = nxt;
-    }
-
-    /* expire aux */
-    idx = tw_head_aux[tw_now_slot];
-    tw_head_aux[tw_now_slot] = -1;
-    while (idx != -1) {
-      int nxt = aux[idx].tw_next;
-      aux[idx].tw_slot = aux[idx].tw_next = -1;
-      drop_and_clear_aux(&aux[idx]);
-      idx = nxt;
-    }
+    expire_slot_lists(tw_now_slot);
   }
 }
 
