@@ -446,7 +446,10 @@ static void tw_advance(time_t now_sec) {
   if (now_sec <= tw_now_sec) return;
 
   time_t delta = now_sec - tw_now_sec;
-
+  if (delta > 10) {
+    fprintf(stderr, "tw_advance: tw_now_sec=%ld now_sec%ld delta=%ld\n",
+                  (long)tw_now_sec, (long)now_sec, (long)delta);
+  }
   /* BIG JUMP: if we jumped >= full wheel, everything expires */
   if (delta >= TW_SLOTS) {
     for (int s = 0; s < TW_SLOTS; ++s) {
