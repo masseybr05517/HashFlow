@@ -145,7 +145,7 @@ static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cond_full = PTHREAD_COND_INITIALIZER;
 static pthread_t zmq_thread;
 static int exiting = 0;
-
+static void dump_active_flows(time_t now_sec);
 /* ================================================================= */
 /*                           Timing-wheel                            */
 /* ================================================================= */
