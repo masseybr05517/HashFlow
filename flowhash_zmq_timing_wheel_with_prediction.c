@@ -135,6 +135,8 @@ static uint64_t st_main_wins = 0;
 static uint64_t st_aux_wins  = 0;
 static volatile sig_atomic_t g_dump_requested = 0;
 static volatile sig_atomic_t g_sigquit_dump_full = 0;
+static volatile sig_atomic_t g_in_tw = 0;
+static volatile sig_atomic_t g_tw_now_arg = 0;
 /* ---------- ZMQ batching ring buffer ------------------------------ */
 typedef struct {
   flow_entry_t slot;
@@ -441,6 +443,8 @@ static void expire_slot_lists(int slot) {
 }
 
 static void tw_advance(time_t now_sec) {
+  g_in_tw = 1;
+  g_tw_now_arg = (sig_atomic_t)now_sec;
   if (!tw_initialised) tw_init(now_sec);
 
   if (now_sec <= tw_now_sec) return;
@@ -457,6 +461,7 @@ static void tw_advance(time_t now_sec) {
     }
     tw_now_sec  = now_sec;
     tw_now_slot = (int)(now_sec % TW_SLOTS);
+    g_in_tw = 0;
     return;
   }
 
@@ -812,8 +817,9 @@ static void on_sigquit(int sig) {
   char buf[256];
   int n = snprintf(buf, sizeof(buf),
     "\n=== SIGQUIT RECEIVED ===\n"
-    "tw_now_sec=%ld tw_now_slot=%d\n"
+    "in_tw=%d tw_arg=%d tw_now_sec=%ld slot=%d\n"
     "ZMQ fill=%zu exiting=%d\n",
+    (int)g_in_tw, (int)g_tw_now_arg,
     (long)tw_now_sec, tw_now_slot, fill, exiting);
   if (n > 0) (void)write(STDERR_FILENO, buf, (size_t)n);
 }
