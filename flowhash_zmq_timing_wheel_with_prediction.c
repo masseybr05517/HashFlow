@@ -237,7 +237,8 @@ static inline void enqueue_flow(const flow_entry_t *src) {
   flow_buf[head].slot = *src;
   head = (head + 1) % BUF_MAX;
   fill++;
-  if (fill >= BATCH_SIZE) pthread_cond_signal(&cond_full);
+
+  pthread_cond_signal(&cond_full);  // signal on every enqueue
   pthread_mutex_unlock(&mtx);
 }
 
@@ -249,19 +250,35 @@ static void *sender_thread(void *arg) {
 
   int linger = ZMQ_LINGER_MS;
   zmq_setsockopt(sock, ZMQ_LINGER, &linger, sizeof(linger));
+
+  /* Optional: keep your sndtimeo, but we’ll also use DONTWAIT so we never hang */
   int sndtimeo = ZMQ_SNDTIMEO_MS;
   zmq_setsockopt(sock, ZMQ_SNDTIMEO, &sndtimeo, sizeof(sndtimeo));
 
-  zmq_bind(sock, ZMQ_ENDPOINT);
+  if (zmq_bind(sock, ZMQ_ENDPOINT) != 0) {
+    fprintf(stderr, "zmq_bind(%s) failed: %s\n", ZMQ_ENDPOINT, zmq_strerror(errno));
+    zmq_close(sock);
+    zmq_ctx_term(ctx);
+    return NULL;
+  }
 
-  while (1) {
+  for (;;) {
+    /* ---- wait for work or shutdown ---- */
     pthread_mutex_lock(&mtx);
-    while (fill < BATCH_SIZE && !exiting) pthread_cond_wait(&cond_full, &mtx);
+    while (fill == 0 && !exiting) {
+      pthread_cond_wait(&cond_full, &mtx);
+    }
 
+    if (exiting && fill == 0) {
+      pthread_mutex_unlock(&mtx);
+      break; /* clean exit */
+    }
+
+    /* ---- build a batch (drain up to BATCH_SIZE) ---- */
     json_t *batch = json_array();
     int sent = 0;
 
-    while (fill && sent < BATCH_SIZE) {
+    while (fill > 0 && sent < BATCH_SIZE) {
       buf_item_t item = flow_buf[tail];
       tail = (tail + 1) % BUF_MAX;
       fill--;
@@ -270,16 +287,17 @@ static void *sender_thread(void *arg) {
       json_t *obj = json_from_entry(&item.slot);
       json_array_append_new(batch, obj);
     }
+
     pthread_mutex_unlock(&mtx);
 
+    /* ---- send without ever blocking ---- */
     if (json_array_size(batch) > 0) {
       char *txt = json_dumps(batch, JSON_COMPACT);
-      (void)zmq_send(sock, txt, strlen(txt), 0);
+      int rc = zmq_send(sock, txt, strlen(txt), ZMQ_DONTWAIT);
+      (void)rc; /* optionally inspect rc / errno */
       free(txt);
     }
     json_decref(batch);
-
-    if (exiting && fill == 0) break;
   }
 
   zmq_close(sock);
@@ -807,6 +825,7 @@ int main(int argc, char **argv) {
   exiting = 1;
   pthread_cond_broadcast(&cond_full);
   pthread_mutex_unlock(&mtx);
+  fprintf(stderr, "main: joining sender (fill=%zu exiting=%d)\n", fill, exiting);
   pthread_join(zmq_thread, NULL);
 
   pcap_close(pc);
