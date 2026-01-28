@@ -134,6 +134,7 @@ static uint64_t st_swaps = 0;
 static uint64_t st_main_wins = 0;
 static uint64_t st_aux_wins  = 0;
 static volatile sig_atomic_t g_dump_requested = 0;
+static volatile sig_atomic_t g_sigquit_dump_full = 0;
 /* ---------- ZMQ batching ring buffer ------------------------------ */
 typedef struct {
   flow_entry_t slot;
@@ -659,10 +660,28 @@ static void init_new_entry(flow_entry_t *e, flow_key_t key,
 static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
                          uint16_t sport, uint16_t dport, uint8_t proto,
                          int tcp_syn, int tcp_fin, uint16_t ip_len) {
-  if (g_dump_requested) {
-    g_dump_requested = 0;
-    dump_active_flows(tv->tv_sec);
+  if (g_sigquit_dump_full) {
+  g_sigquit_dump_full = 0;
+
+  int main_cnt = 0, aux_cnt = 0;
+  int main_udp = 0, aux_udp = 0;
+  int main_tcp = 0, aux_tcp = 0;
+
+  for (int i = 0; i < TABLE_SIZE; i++) {
+    if (table[i].in_use) {
+      main_cnt++;
+      if (table[i].is_udp) main_udp++; else main_tcp++;
+    }
+    if (aux[i].in_use) {
+      aux_cnt++;
+      if (aux[i].is_udp) aux_udp++; else aux_tcp++;
+    }
   }
+
+  fprintf(stderr,
+    "ACTIVE: main=%d (udp=%d tcp=%d) aux=%d (udp=%d tcp=%d)\n",
+    main_cnt, main_udp, main_tcp, aux_cnt, aux_udp, aux_tcp);
+ }
   tw_advance(tv->tv_sec);
 
   flow_key_t key = make_key(sip, dip, sport, dport, proto);
@@ -800,6 +819,7 @@ static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
 }
 static void on_sigquit(int sig) {
   (void)sig;
+  g_sigquit_dump_full = 1;
 
   char buf[256];
   int n = snprintf(buf, sizeof(buf),
@@ -807,8 +827,7 @@ static void on_sigquit(int sig) {
     "tw_now_sec=%ld tw_now_slot=%d\n"
     "ZMQ fill=%zu exiting=%d\n",
     (long)tw_now_sec, tw_now_slot, fill, exiting);
-
-  if (n > 0) write(STDERR_FILENO, buf, (size_t)n);
+  if (n > 0) (void)write(STDERR_FILENO, buf, (size_t)n);
 }
 
 static void dump_active_flows(time_t now_sec) {
