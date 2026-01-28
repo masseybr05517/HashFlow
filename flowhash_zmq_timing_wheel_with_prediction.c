@@ -34,7 +34,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <zmq.h>
-
+#include <unistd.h>
 /* tl2cgen header */
 #include "../rf_first8_40packets_build/header.h"
 
@@ -800,7 +800,15 @@ static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
 }
 static void on_sigquit(int sig) {
   (void)sig;
-  g_dump_requested = 1;
+
+  char buf[256];
+  int n = snprintf(buf, sizeof(buf),
+    "\n=== SIGQUIT RECEIVED ===\n"
+    "tw_now_sec=%ld tw_now_slot=%d\n"
+    "ZMQ fill=%zu exiting=%d\n",
+    (long)tw_now_sec, tw_now_slot, fill, exiting);
+
+  if (n > 0) write(STDERR_FILENO, buf, (size_t)n);
 }
 
 static void dump_active_flows(time_t now_sec) {
