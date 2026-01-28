@@ -659,6 +659,10 @@ static void init_new_entry(flow_entry_t *e, flow_key_t key,
 static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
                          uint16_t sport, uint16_t dport, uint8_t proto,
                          int tcp_syn, int tcp_fin, uint16_t ip_len) {
+  if (g_dump_requested) {
+    g_dump_requested = 0;
+    dump_active_flows(tv->tv_sec);
+  }
   tw_advance(tv->tv_sec);
 
   flow_key_t key = make_key(sip, dip, sport, dport, proto);
