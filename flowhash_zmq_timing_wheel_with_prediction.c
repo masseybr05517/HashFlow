@@ -20,6 +20,7 @@
 #include <arpa/inet.h>
 #include <inttypes.h>
 #include <jansson.h>
+#include <signal.h>
 #include <math.h>
 #include <netinet/if_ether.h>
 #include <netinet/ip.h>
@@ -132,7 +133,7 @@ static uint64_t st_duels = 0;
 static uint64_t st_swaps = 0;
 static uint64_t st_main_wins = 0;
 static uint64_t st_aux_wins  = 0;
-
+static volatile sig_atomic_t g_dump_requested = 0;
 /* ---------- ZMQ batching ring buffer ------------------------------ */
 typedef struct {
   flow_entry_t slot;
@@ -793,6 +794,54 @@ static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
   track_packet(&h->ts, sip, dip, sport, dport, proto, syn, fin, ntohs(ip->ip_len));
   return 1;
 }
+static void on_sigquit(int sig) {
+  (void)sig;
+  g_dump_requested = 1;
+}
+
+static void dump_active_flows(time_t now_sec) {
+  int main_cnt = 0, aux_cnt = 0;
+  int main_udp = 0, aux_udp = 0;
+
+  fprintf(stderr, "\n=== DUMP ACTIVE FLOWS (now=%ld, tw_now=%ld slot=%d) ===\n",
+          (long)now_sec, (long)tw_now_sec, tw_now_slot);
+
+  /* show up to N examples so output stays readable */
+  int shown = 0;
+  const int MAX_SHOW = 50;
+
+  for (int i = 0; i < TABLE_SIZE; ++i) {
+    if (table[i].in_use) {
+      main_cnt++;
+      if (table[i].is_udp) main_udp++;
+
+      if (shown < MAX_SHOW) {
+        char ca[INET_ADDRSTRLEN], sa[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &table[i].cli_ip, ca, sizeof ca);
+        inet_ntop(AF_INET, &table[i].srv_ip, sa, sizeof sa);
+
+        fprintf(stderr,
+                "MAIN[%d] %s:%u ↔ %s:%u %s cnt=%d tw_slot=%d fin=%d/%d\n",
+                i, ca, table[i].cli_port, sa, table[i].srv_port,
+                table[i].is_udp ? "UDP" : "TCP",
+                table[i].count, table[i].tw_slot,
+                table[i].fin_cli_done, table[i].fin_srv_done);
+        shown++;
+      }
+    }
+
+    if (aux[i].in_use) {
+      aux_cnt++;
+      if (aux[i].is_udp) aux_udp++;
+    }
+  }
+
+  fprintf(stderr, "Totals: main=%d (udp=%d) aux=%d (udp=%d)\n",
+          main_cnt, main_udp, aux_cnt, aux_udp);
+  fprintf(stderr, "ZMQ buffer: fill=%zu head=%zu tail=%zu exiting=%d\n",
+          fill, head, tail, exiting);
+  fprintf(stderr, "=== END DUMP ===\n\n");
+}
 
 /* ================================================================= */
 /*                                main                               */
@@ -802,6 +851,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "usage: %s file.pcap\n", argv[0]);
     return 1;
   }
+  signal(SIGQUIT, on_sigquit);  /* Ctrl+\ */
 
   /* sanity: model expects 27 features for first_n=8 */
   if (get_num_feature() != 27) {
