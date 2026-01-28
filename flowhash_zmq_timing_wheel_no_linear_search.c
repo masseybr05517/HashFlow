@@ -10,7 +10,7 @@
  *    gcc flowhash_zmq_timing_wheel.c -std=c11 -O2 -Wall -pthread -lpcap \
  *        $(pkg-config --cflags --libs jansson libzmq) -o flowhash_zmq_timing_wheel
  *********************************************************************/
-
+ #define _DEFAULT_SOURCE
  #include <arpa/inet.h>
  #include <inttypes.h>
  #include <jansson.h>
@@ -18,6 +18,7 @@
  #include <netinet/ip.h>
  #include <netinet/tcp.h>
  #include <netinet/udp.h>
+ #include <sys/types.h>
  #include <pcap.h>
  #include <pthread.h>
  #include <stdio.h>
@@ -35,7 +36,7 @@
  #define BUF_MAX 64             /* flow buffer for ZMQ sender thread  */
  #define BATCH_SIZE 16          /* flows per JSON batch               */
  #define SHOW_OUTPUT 1          /* set 1 for stderr debug prints      */
- #define WRITE_TO_CSV 0
+ #define WRITE_TO_CSV 1
  
  /* ---------- tiny FNV-1a 32-bit ------------------------------------ */
  static uint32_t fnv1a_32(const char *s) {
@@ -81,6 +82,7 @@
  static time_t tw_now_sec = 0;
  static int tw_now_slot = 0;
  static int tw_initialised = 0;
+ static time_t last_pcap_sec = 0;
  static inline int idx_of(flow_entry_t *e) { return (int)(e - table); }
  
  /* ---------- ZMQ batching buffer ---------------------------------- */
@@ -445,7 +447,7 @@ static void write_to_csv(flow_entry_t *e)
      dport = ntohs(uh->uh_dport);
    } else
      return 0;
- 
+   last_pcap_sec = h->ts.tv_sec;
    track_packet(&h->ts, sip, dip, sport, dport, proto, syn, fin,
                 ntohs(ip->ip_len));
    return 1;
@@ -482,7 +484,8 @@ static void write_to_csv(flow_entry_t *e)
    /* final flush: advance far enough to expire everything */
    struct timeval tv;
    gettimeofday(&tv, NULL);
-   tw_advance(tv.tv_sec + UDP_IDLE_SEC + TW_SLOTS);
+   /*tw_advance(tv.tv_sec + UDP_IDLE_SEC + TW_SLOTS); previous version */
+   tw_advance(last_pcap_sec + UDP_IDLE_SEC + TW_SLOTS);
  
    for (int i = 0; i < TABLE_SIZE; ++i)
      if (table[i].in_use) dump_and_clear(&table[i]);

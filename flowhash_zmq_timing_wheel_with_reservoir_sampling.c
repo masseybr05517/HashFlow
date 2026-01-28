@@ -20,6 +20,7 @@
  #include <netinet/ip.h>
  #include <netinet/tcp.h>
  #include <netinet/udp.h>
+ #include <sys/types.h>
  #include <pcap.h>
  #include <pthread.h>
  #include <stdio.h>
@@ -37,7 +38,7 @@
  #define BUF_MAX 64             /* flow buffer for ZMQ sender thread  */
  #define BATCH_SIZE 16          /* flows per JSON batch               */
  #define SHOW_OUTPUT 1          /* set 1 for stderr debug prints      */
- #define WRITE_TO_CSV 0
+ #define WRITE_TO_CSV 1
  #define EVICT_START_COUNT 30
  
  /* ---------- tiny FNV-1a 32-bit ------------------------------------ */
