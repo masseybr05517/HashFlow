@@ -100,6 +100,7 @@ typedef struct flow_entry {
 
   /* --- timing-wheel bookkeeping --- */
   int tw_next;
+  int tw_prev;
   int tw_slot;
 } flow_entry_t;
 
@@ -167,38 +168,48 @@ static void tw_init(time_t start_sec) {
 }
 
 /* Generic wheel remove/insert operating on a base table + wheel head list. */
-static void tw_remove_generic(flow_entry_t *base, int *tw_head, int idx) {
+static void tw_remove_generic(flow_entry_t *base,
+                              int *tw_head,
+                              int idx)
+{
   flow_entry_t *e = &base[idx];
-  if (e->tw_slot < 0) return;
+  if (e->tw_slot < 0)
+    return;
 
   int slot = e->tw_slot;
-  int cur = tw_head[slot];
-  int prev = -1;
-  while (cur != -1 && cur != idx) {
-    prev = cur;
-    cur = base[cur].tw_next;
-  }
 
-  if (cur == -1) {
-    e->tw_slot = e->tw_next = -1;
-    return;
-  }
-
-  if (prev == -1)
-    tw_head[slot] = base[cur].tw_next;
+  if (e->tw_prev != -1)
+    base[e->tw_prev].tw_next = e->tw_next;
   else
-    base[prev].tw_next = base[cur].tw_next;
+    tw_head[slot] = e->tw_next;
 
-  e->tw_slot = e->tw_next = -1;
+  if (e->tw_next != -1)
+    base[e->tw_next].tw_prev = e->tw_prev;
+
+  e->tw_slot = -1;
+  e->tw_next = -1;
+  e->tw_prev = -1;
 }
 
-static void tw_insert_generic(flow_entry_t *base, int *tw_head, int idx, time_t exp_sec) {
+static void tw_insert_generic(flow_entry_t *base,
+                              int *tw_head,
+                              int idx,
+                              time_t exp_sec)
+{
   flow_entry_t *e = &base[idx];
-  if (e->tw_slot >= 0) tw_remove_generic(base, tw_head, idx);
+
+  if (e->tw_slot >= 0)
+    tw_remove_generic(base, tw_head, idx);
 
   int slot = (int)(exp_sec % TW_SLOTS);
+
   e->tw_slot = slot;
+  e->tw_prev = -1;
   e->tw_next = tw_head[slot];
+
+  if (tw_head[slot] != -1)
+    base[tw_head[slot]].tw_prev = idx;
+
   tw_head[slot] = idx;
 }
 
@@ -409,7 +420,7 @@ static void dump_and_clear_main(flow_entry_t *e) {
   enqueue_flow(e);
 
   memset(e, 0, sizeof *e);
-  e->tw_slot = e->tw_next = -1;
+  e->tw_slot = e->tw_next = e->tw_prev = -1;
 }
 
 /* Aux flows: we generally DROP on expiration / losing duel (no output). */
@@ -417,7 +428,7 @@ static void drop_and_clear_aux(flow_entry_t *e) {
   int idx = idx_of(aux, e);
   tw_remove_generic(aux, tw_head_aux, idx);
   memset(e, 0, sizeof *e);
-  e->tw_slot = e->tw_next = -1;
+  e->tw_slot = e->tw_next = e->tw_prev = -1;
 }
 
 /* ================================================================= */
@@ -670,7 +681,7 @@ static void init_new_entry(flow_entry_t *e, flow_key_t key,
   e->cli_port = sport;
   e->srv_port = dport;
 
-  e->tw_slot = e->tw_next = -1;
+  e->tw_slot = e->tw_next = e->tw_prev = -1;
 }
 
 static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
