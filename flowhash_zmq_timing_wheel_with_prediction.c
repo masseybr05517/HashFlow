@@ -137,6 +137,9 @@ static volatile sig_atomic_t g_dump_requested = 0;
 static volatile sig_atomic_t g_sigquit_dump_full = 0;
 static volatile sig_atomic_t g_in_tw = 0;
 static volatile sig_atomic_t g_tw_now_arg = 0;
+
+static uint64_t st_predict_calls = 0;
+static uint64_t st_keep_calls = 0;
 /* ---------- ZMQ batching ring buffer ------------------------------ */
 typedef struct {
   flow_entry_t slot;
@@ -568,6 +571,7 @@ static int build_feature_entries_first8(const flow_entry_t *e, union Entry *x, i
 }
 
 static inline double score_reach40(const flow_entry_t *e) {
+  st_predict_calls++;
   int32_t nfeat = get_num_feature(); /* should be 27 */
   union Entry xbuf[32];
   if (nfeat != 27) return 1.0; /* fail-open */
@@ -581,6 +585,7 @@ static inline double score_reach40(const flow_entry_t *e) {
 }
 
 static inline int keep_yesno(const flow_entry_t *e) {
+  st_keep_calls++;
   double p = score_reach40(e);
   return (p >= EVICT_THRESHOLD);
 }
@@ -819,11 +824,13 @@ static void on_sigquit(int sig) {
 
   char buf[256];
   int n = snprintf(buf, sizeof(buf),
-    "\n=== SIGQUIT RECEIVED ===\n"
-    "in_tw=%d tw_arg=%d tw_now_sec=%ld slot=%d\n"
-    "ZMQ fill=%zu exiting=%d\n",
-    (int)g_in_tw, (int)g_tw_now_arg,
-    (long)tw_now_sec, tw_now_slot, fill, exiting);
+  "\n=== SIGQUIT RECEIVED ===\n"
+  "in_tw=%d tw_arg=%d tw_now_sec=%ld slot=%d\n"
+  "... duels=%" PRIu64 " keep_calls=%" PRIu64 " predict_calls=%" PRIu64 "\n"
+  "ZMQ fill=%zu exiting=%d\n",
+  (int)g_in_tw, (int)g_tw_now_arg, (long)tw_now_sec, tw_now_slot,
+  st_duels, st_keep_calls, st_predict_calls,
+  fill, exiting);
   if (n > 0) (void)write(STDERR_FILENO, buf, (size_t)n);
 }
 
