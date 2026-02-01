@@ -381,7 +381,9 @@ static void write_to_csv(flow_entry_t *e) {
 
   char input_field[256];
   snprintf(input_field, sizeof(input_field), "%s%d%s%d%s",
-           ip_small, e->key.port1, ip_large, e->key.port2, e->is_udp ? "UDP" : "TCP");
+           ip_small, e->key.port1,
+           ip_large, e->key.port2,
+           e->is_udp ? "UDP" : "TCP");
 
   char feature_vector[4096];
   size_t w = 0;
@@ -394,7 +396,8 @@ static void write_to_csv(flow_entry_t *e) {
     if (e->len[i] < 0) offset *= -1;
 
     w += (size_t)snprintf(feature_vector + w, sizeof(feature_vector) - w,
-                          "(%.6f, %.1f)%s", offset, (double)e->len[i],
+                          "(%.6f, %.1f)%s",
+                          offset, (double)e->len[i],
                           (i < e->count - 1) ? ", " : "");
     if (w >= sizeof(feature_vector)) break;
   }
@@ -402,11 +405,17 @@ static void write_to_csv(flow_entry_t *e) {
   if (w < sizeof(feature_vector))
     (void)snprintf(feature_vector + w, sizeof(feature_vector) - w, "]");
 
-  FILE *f = fopen("flow_output_timing_wheel_zmq.csv", "a");
+  /* CHANGE: split CSV output by protocol */
+  const char *fname = e->is_udp
+    ? "flow_output_timing_wheel_with_prediction_udp.csv"
+    : "flow_output_timing_wheel_with_prediction_tcp.csv";
+
+  FILE *f = fopen(fname, "a");
   if (!f) { perror("fopen"); exit(1); }
   fprintf(f, "%s,\"%s\"\n", input_field, feature_vector);
   fclose(f);
 }
+
 
 /* ================================================================= */
 /*                     flow finalisation & output                     */
