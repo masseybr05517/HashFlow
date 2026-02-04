@@ -1,39 +1,30 @@
 /*********************************************************************
- *  flowhash_zmq_timing_wheel_with_prediction.c
+ *  flowhash_zmq_timing_wheel_with_prediction_two_tables_bloom.c
  *
- *  Restored core system:
- *   - Timing wheel UDP idle flush
- *   - TCP FIN+FIN (only flush at FLOW_CAP, per original)
- *   - JSON encode + ZMQ batch push sender thread
- *   - Optional CSV logging
+ *  FIX (Feb 2026):
+ *   - Correct aux-table indexing when aux tables are smaller than main:
+ *       p_main = h & (TABLE_SIZE - 1)
+ *       p_aux  = h & (AUX_SIZE  - 1)   (protocol-specific)
+ *   - Update all uses of p so we never index aux_* with TABLE_SIZE-range
+ *   - Update duel/swap to use (p_main, p_aux)
+ *   - Fix SIGQUIT “ACTIVE” table scans to respect correct sizes
+ *   - Fix dump_active_flows loops/sizes
+ *   - Fix write() warn_unused_result
+ *   - Mark dump_active_flows unused (unless you wire it up)
  *
- *  New additions:
- *   - Auxiliary contender table per bucket to track colliding flows until FIRST_N
- *   - Contention-aware ML duel resolution using tl2cgen predict() at FIRST_N=8
- *   - No eviction unless a contender exists
- *   - Duel rules A/B/C + swap rule
- *
- *  CHANGE (Feb 2026):
- *   - Split tables by protocol:
- *       TCP: table_tcp + aux_tcp
- *       UDP: table_udp + aux_udp
- *   - Timing wheel is now UDP-only (no TCP wheel membership)
- *
- *  CHANGE (Feb 2026 - this revision):
- *   - Add UDP-only Bloom filter admission gate:
- *       * Used ONLY when a UDP flow would be inserted as a new entry (main or aux).
- *       * If Bloom says "probably seen", refuse to create a new UDP entry (drop packet).
- *       * If Bloom says "definitely not seen", add to Bloom and admit it.
- *     WARNING: Bloom filters can false-positive, which may reject a truly new UDP flow.
- *
+ *  NOTE:
+ *   With AUX_SIZE < TABLE_SIZE, multiple main buckets map to one aux bucket
+ *   (p_aux = p_main & (AUX_SIZE-1)). This is safe and works, but it is not a
+ *   strict “one aux per main bucket” design. If you want strict 1:1, make
+ *   aux tables TABLE_SIZE.
  *********************************************************************/
 
 #define _DEFAULT_SOURCE
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <jansson.h>
-#include <signal.h>
 #include <math.h>
 #include <netinet/if_ether.h>
 #include <netinet/ip.h>
@@ -41,47 +32,45 @@
 #include <netinet/udp.h>
 #include <pcap.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <time.h>
-#include <zmq.h>
 #include <unistd.h>
-#include <errno.h>
+#include <zmq.h>
 
 /* tl2cgen header */
 #include "../rf_first8_40packets_build/header.h"
 
 /* ---------- parameters ------------------------------------------- */
 #define TABLE_SIZE (8192) /* must be power of 2 */
-#define FLOW_CAP 40            /* pkts per flow      */
-#define FIRST_N 8              /* packets used by model */
-#define UDP_IDLE_SEC 30        /* idle timeout UDP   */
-#define TW_SLOTS 256           /* must be power of 2 */
-#define BUF_MAX 64             /* ring buffer slots  */
-#define BATCH_SIZE 16          /* flows per JSON msg */
-#define SHOW_OUTPUT 0          /* stderr debug prints */
+#define FLOW_CAP 40
+#define FIRST_N 8
+#define UDP_IDLE_SEC 30
+#define TW_SLOTS 256 /* must be power of 2 */
+#define BUF_MAX 64
+#define BATCH_SIZE 16
+#define SHOW_OUTPUT 0
 #define WRITE_TO_CSV 1
-#define UDP_MAIN_SIZE  (TABLE_SIZE)
-#define UDP_AUX_SIZE   (TABLE_SIZE / 4)
-#define TCP_MAIN_SIZE  (TABLE_SIZE)   /* if you have a tcp table too */
-#define TCP_AUX_SIZE   (TABLE_SIZE / 4) /* if applicable */
+
+#define UDP_MAIN_SIZE (TABLE_SIZE)
+#define UDP_AUX_SIZE (TABLE_SIZE / 4)
+#define TCP_MAIN_SIZE (TABLE_SIZE)
+#define TCP_AUX_SIZE (TABLE_SIZE / 4)
 
 /* ML gate */
-#define EVICT_THRESHOLD 0.50   /* threshold for yes/no */
+#define EVICT_THRESHOLD 0.50
 
 /* ZMQ shutdown / blocking behavior */
 #define ZMQ_LINGER_MS 0
-#define ZMQ_SNDTIMEO_MS 100 /* set 0 for "don't wait" or keep small */
+#define ZMQ_SNDTIMEO_MS 100
 #define ZMQ_ENDPOINT "ipc:///tmp/flowpipe"
 
 /* ---------- UDP Bloom filter (UDP-only admission gate) ------------ */
-/* Tune these for your workload. Bigger = fewer false positives.      */
-/* Bits must be power-of-two for fast masking.                        */
-#define UDP_BLOOM_BITS   (1u << 28)   /* 134,217,728 bits  (~16 MB) */
-#define UDP_BLOOM_BYTES  (UDP_BLOOM_BITS / 8u)
-/* How many hash functions (k). 4 is a good practical compromise. */
+#define UDP_BLOOM_BITS (1u << 28) /* 134,217,728 bits (~16 MB) */
+#define UDP_BLOOM_BYTES (UDP_BLOOM_BITS / 8u)
 #define UDP_BLOOM_K 4
 
 static uint8_t udp_bloom[UDP_BLOOM_BYTES];
@@ -90,13 +79,17 @@ static uint8_t udp_bloom[UDP_BLOOM_BYTES];
 #if (TABLE_SIZE & (TABLE_SIZE - 1)) != 0
 #error "TABLE_SIZE must be a power of two"
 #endif
-
 #if (TW_SLOTS & (TW_SLOTS - 1)) != 0
 #error "TW_SLOTS must be a power of two"
 #endif
-
 #if (UDP_BLOOM_BITS & (UDP_BLOOM_BITS - 1)) != 0
 #error "UDP_BLOOM_BITS must be a power of two"
+#endif
+#if (UDP_AUX_SIZE & (UDP_AUX_SIZE - 1)) != 0
+#error "UDP_AUX_SIZE must be a power of two (TABLE_SIZE/4 is OK if TABLE_SIZE is power of two)"
+#endif
+#if (TCP_AUX_SIZE & (TCP_AUX_SIZE - 1)) != 0
+#error "TCP_AUX_SIZE must be a power of two (TABLE_SIZE/4 is OK if TABLE_SIZE is power of two)"
 #endif
 
 /* ---------- tiny FNV-1a 32-bit ------------------------------------ */
@@ -110,17 +103,11 @@ static uint32_t fnv1a_32(const char *s) {
 }
 
 /* ---------- UDP Bloom helpers ------------------------------------- */
-static inline void udp_bloom_clear(void) {
-  memset(udp_bloom, 0, sizeof udp_bloom);
-}
+static inline void udp_bloom_clear(void) { memset(udp_bloom, 0, sizeof udp_bloom); }
 
-static inline void bloom_set_bit(uint32_t bit) {
-  udp_bloom[bit >> 3] |= (uint8_t)(1u << (bit & 7u));
-}
+static inline void bloom_set_bit(uint32_t bit) { udp_bloom[bit >> 3] |= (uint8_t)(1u << (bit & 7u)); }
 
-static inline int bloom_get_bit(uint32_t bit) {
-  return (udp_bloom[bit >> 3] >> (bit & 7u)) & 1u;
-}
+static inline int bloom_get_bit(uint32_t bit) { return (udp_bloom[bit >> 3] >> (bit & 7u)) & 1u; }
 
 static inline uint32_t mix32(uint32_t x) {
   x ^= x >> 16;
@@ -150,10 +137,10 @@ typedef struct flow_entry {
   int fin_cli_done, fin_srv_done;
 
   struct timeval ts[FLOW_CAP];
-  int32_t len[FLOW_CAP];  /* sign encodes direction, magnitude is ip_len */
+  int32_t len[FLOW_CAP]; /* sign encodes direction, magnitude is ip_len */
   int count;
 
-  /* --- timing-wheel bookkeeping --- (UDP-only tables will use these) */
+  /* --- timing-wheel bookkeeping (UDP-only) */
   int tw_next;
   int tw_prev;
   int tw_slot;
@@ -165,29 +152,29 @@ static inline int idx_of(flow_entry_t *base, flow_entry_t *e) { return (int)(e -
  * UDP Bloom query:
  * Returns 1 if "probably seen", 0 if "definitely not seen".
  * If add_if_new=1, inserts into bloom when definitely-not-seen.
- *
- * NOTE: We hash the canonical key fields directly (no strings).
  */
-static inline int udp_bloom_probably_seen_and_maybe_add(const flow_key_t *k, int add_if_new)
-{
-  /* FNV-like rolling hash over canonical fields */
+static inline int udp_bloom_probably_seen_and_maybe_add(const flow_key_t *k, int add_if_new) {
   uint32_t h1 = 2166136261u;
-  h1 ^= (uint32_t)k->ip1;   h1 *= 16777619u;
-  h1 ^= (uint32_t)k->ip2;   h1 *= 16777619u;
-  h1 ^= (uint32_t)k->port1; h1 *= 16777619u;
-  h1 ^= (uint32_t)k->port2; h1 *= 16777619u;
-  h1 ^= (uint32_t)k->proto; h1 *= 16777619u;
+  h1 ^= (uint32_t)k->ip1;
+  h1 *= 16777619u;
+  h1 ^= (uint32_t)k->ip2;
+  h1 *= 16777619u;
+  h1 ^= (uint32_t)k->port1;
+  h1 *= 16777619u;
+  h1 ^= (uint32_t)k->port2;
+  h1 *= 16777619u;
+  h1 ^= (uint32_t)k->proto;
+  h1 *= 16777619u;
 
   uint32_t h2 = mix32(h1 ^ 0x9e3779b9u);
-  if (h2 == 0) h2 = 0x27d4eb2du;
+  if (h2 == 0)
+    h2 = 0x27d4eb2du;
 
   uint32_t mask = (uint32_t)(UDP_BLOOM_BITS - 1u);
 
-  /* Check bits */
   for (uint32_t i = 0; i < UDP_BLOOM_K; i++) {
     uint32_t bit = (h1 + i * h2) & mask;
     if (!bloom_get_bit(bit)) {
-      /* definitely not present */
       if (add_if_new) {
         for (uint32_t j = 0; j < UDP_BLOOM_K; j++) {
           uint32_t b2 = (h1 + j * h2) & mask;
@@ -197,17 +184,16 @@ static inline int udp_bloom_probably_seen_and_maybe_add(const flow_key_t *k, int
       return 0;
     }
   }
-
-  return 1; /* probably present */
+  return 1;
 }
 
 /* ================================================================= */
-/*                     Tables: now split by protocol                  */
+/*                     Tables: split by protocol                      */
 /* ================================================================= */
 
 /* TCP-only tables */
 static flow_entry_t table_tcp[TABLE_SIZE] = {0};
-static flow_entry_t aux_tcp[TCP_AUX_SIZE]   = {0};
+static flow_entry_t aux_tcp[TCP_AUX_SIZE] = {0};
 
 /* UDP-only tables */
 static flow_entry_t table_udp[TABLE_SIZE] = {0};
@@ -217,7 +203,6 @@ static flow_entry_t aux_udp[UDP_AUX_SIZE] = {0};
 /*                           Timing-wheel (UDP-only)                  */
 /* ================================================================= */
 
-/* We keep wheel heads only for UDP tables. TCP never joins the wheel. */
 static int tw_head_udp_main[TW_SLOTS];
 static int tw_head_udp_aux[TW_SLOTS];
 
@@ -228,17 +213,17 @@ static time_t last_pcap_sec = 0;
 
 /* ---------- stats ------------------------------------------------- */
 static uint64_t st_flows_inserted = 0;
-static uint64_t st_flows_matched  = 0;
+static uint64_t st_flows_matched = 0;
 static uint64_t st_packets_tracked = 0;
 
 static uint64_t st_aux_inserted = 0;
-static uint64_t st_aux_matched  = 0;
+static uint64_t st_aux_matched = 0;
 static uint64_t st_aux_third_dropped = 0;
 
 static uint64_t st_duels = 0;
 static uint64_t st_swaps = 0;
 static uint64_t st_main_wins = 0;
-static uint64_t st_aux_wins  = 0;
+static uint64_t st_aux_wins = 0;
 
 static uint64_t st_udp_bloom_refused = 0;
 
@@ -261,7 +246,7 @@ static pthread_cond_t cond_full = PTHREAD_COND_INITIALIZER;
 static pthread_t zmq_thread;
 static int exiting = 0;
 
-static void dump_active_flows(time_t now_sec);
+__attribute__((unused)) static void dump_active_flows(time_t now_sec);
 
 /* ================================================================= */
 /*                           Timing-wheel helpers                     */
@@ -270,16 +255,14 @@ static void dump_active_flows(time_t now_sec);
 static void tw_init(time_t start_sec) {
   for (int i = 0; i < TW_SLOTS; ++i) {
     tw_head_udp_main[i] = -1;
-    tw_head_udp_aux[i]  = -1;
+    tw_head_udp_aux[i] = -1;
   }
   tw_now_sec = start_sec;
   tw_now_slot = (int)(start_sec % TW_SLOTS);
   tw_initialised = 1;
 }
 
-/* Generic wheel remove/insert operating on a base table + wheel head list. */
-static void tw_remove_generic(flow_entry_t *base, int *tw_head, int idx)
-{
+static void tw_remove_generic(flow_entry_t *base, int *tw_head, int idx) {
   flow_entry_t *e = &base[idx];
   if (e->tw_slot < 0)
     return;
@@ -299,8 +282,7 @@ static void tw_remove_generic(flow_entry_t *base, int *tw_head, int idx)
   e->tw_prev = -1;
 }
 
-static void tw_insert_generic(flow_entry_t *base, int *tw_head, int idx, time_t exp_sec)
-{
+static void tw_insert_generic(flow_entry_t *base, int *tw_head, int idx, time_t exp_sec) {
   flow_entry_t *e = &base[idx];
 
   if (e->tw_slot >= 0)
@@ -322,7 +304,8 @@ static void tw_insert_generic(flow_entry_t *base, int *tw_head, int idx, time_t 
 /*                       JSON encoding helpers                        */
 /* ================================================================= */
 static json_t *json_from_entry(const flow_entry_t *f) {
-  if (f->count <= 0) return json_object();
+  if (f->count <= 0)
+    return json_object();
 
   char cli[INET_ADDRSTRLEN], srv[INET_ADDRSTRLEN];
   inet_ntop(AF_INET, &f->cli_ip, cli, sizeof cli);
@@ -361,7 +344,7 @@ static inline void enqueue_flow(const flow_entry_t *src) {
   head = (head + 1) % BUF_MAX;
   fill++;
 
-  pthread_cond_signal(&cond_full);  // signal on every enqueue
+  pthread_cond_signal(&cond_full);
   pthread_mutex_unlock(&mtx);
 }
 
@@ -427,24 +410,32 @@ static void *sender_thread(void *arg) {
 /*                         helper functions                           */
 /* ================================================================= */
 static int compare_key(const flow_key_t *a, const flow_key_t *b) {
-  return !(a->ip1 == b->ip1 && a->ip2 == b->ip2 &&
-           a->port1 == b->port1 && a->port2 == b->port2 &&
+  return !(a->ip1 == b->ip1 && a->ip2 == b->ip2 && a->port1 == b->port1 && a->port2 == b->port2 &&
            a->proto == b->proto);
 }
 
-static flow_key_t make_key(uint32_t s_ip, uint32_t d_ip, uint16_t s_pt,
-                           uint16_t d_pt, uint8_t proto) {
+static flow_key_t make_key(uint32_t s_ip, uint32_t d_ip, uint16_t s_pt, uint16_t d_pt, uint8_t proto) {
   flow_key_t k;
   if (ntohl(s_ip) < ntohl(d_ip)) {
-    k.ip1 = s_ip; k.ip2 = d_ip;
-    k.port1 = s_pt; k.port2 = d_pt;
+    k.ip1 = s_ip;
+    k.ip2 = d_ip;
+    k.port1 = s_pt;
+    k.port2 = d_pt;
   } else if (ntohl(s_ip) > ntohl(d_ip)) {
-    k.ip1 = d_ip; k.ip2 = s_ip;
-    k.port1 = d_pt; k.port2 = s_pt;
+    k.ip1 = d_ip;
+    k.ip2 = s_ip;
+    k.port1 = d_pt;
+    k.port2 = s_pt;
   } else {
-    k.ip1 = s_ip; k.ip2 = d_ip;
-    if (s_pt > d_pt) { uint16_t t = s_pt; s_pt = d_pt; d_pt = t; }
-    k.port1 = s_pt; k.port2 = d_pt;
+    k.ip1 = s_ip;
+    k.ip2 = d_ip;
+    if (s_pt > d_pt) {
+      uint16_t t = s_pt;
+      s_pt = d_pt;
+      d_pt = t;
+    }
+    k.port1 = s_pt;
+    k.port2 = d_pt;
   }
   k.proto = proto;
   return k;
@@ -452,26 +443,23 @@ static flow_key_t make_key(uint32_t s_ip, uint32_t d_ip, uint16_t s_pt,
 
 static inline int coinflip(void) { return rand() & 1; }
 
-static inline double tv_to_sec(const struct timeval *tv) {
-  return (double)tv->tv_sec + (double)tv->tv_usec / 1e6;
-}
+static inline double tv_to_sec(const struct timeval *tv) { return (double)tv->tv_sec + (double)tv->tv_usec / 1e6; }
 
 static inline double dabs(double x) { return x < 0 ? -x : x; }
 
 /* ================================================================= */
-/*                         CSV logging (unchanged)                    */
+/*                         CSV logging                                */
 /* ================================================================= */
 static void write_to_csv(flow_entry_t *e) {
-  if (e->count != FLOW_CAP) return;
+  if (e->count != FLOW_CAP)
+    return;
 
   char ip_small[INET_ADDRSTRLEN], ip_large[INET_ADDRSTRLEN];
   inet_ntop(AF_INET, &e->key.ip1, ip_small, sizeof(ip_small));
   inet_ntop(AF_INET, &e->key.ip2, ip_large, sizeof(ip_large));
 
   char input_field[256];
-  snprintf(input_field, sizeof(input_field), "%s%d%s%d%s",
-           ip_small, e->key.port1,
-           ip_large, e->key.port2,
+  snprintf(input_field, sizeof(input_field), "%s%d%s%d%s", ip_small, e->key.port1, ip_large, e->key.port2,
            e->is_udp ? "UDP" : "TCP");
 
   char feature_vector[4096];
@@ -482,29 +470,29 @@ static void write_to_csv(flow_entry_t *e) {
   for (int i = 0; i < e->count; ++i) {
     double ts = e->ts[i].tv_sec + e->ts[i].tv_usec / 1e6;
     double offset = ts - ts_0;
-    if (e->len[i] < 0) offset *= -1;
+    if (e->len[i] < 0)
+      offset *= -1;
 
-    w += (size_t)snprintf(feature_vector + w, sizeof(feature_vector) - w,
-                          "(%.6f, %.1f)%s",
-                          offset, (double)e->len[i],
+    w += (size_t)snprintf(feature_vector + w, sizeof(feature_vector) - w, "(%.6f, %.1f)%s", offset, (double)e->len[i],
                           (i < e->count - 1) ? ", " : "");
-    if (w >= sizeof(feature_vector)) break;
+    if (w >= sizeof(feature_vector))
+      break;
   }
 
   if (w < sizeof(feature_vector))
     (void)snprintf(feature_vector + w, sizeof(feature_vector) - w, "]");
 
-  /* CHANGE: split CSV output by protocol */
-  const char *fname = e->is_udp
-    ? "flow_output_timing_wheel_with_prediction_udp.csv"
-    : "flow_output_timing_wheel_with_prediction_tcp.csv";
+  const char *fname =
+      e->is_udp ? "flow_output_timing_wheel_with_prediction_udp.csv" : "flow_output_timing_wheel_with_prediction_tcp.csv";
 
   FILE *f = fopen(fname, "a");
-  if (!f) { perror("fopen"); exit(1); }
+  if (!f) {
+    perror("fopen");
+    exit(1);
+  }
   fprintf(f, "%s,\"%s\"\n", input_field, feature_vector);
   fclose(f);
 }
-
 
 /* ================================================================= */
 /*                     flow finalisation & output                     */
@@ -518,14 +506,15 @@ static void dump_and_clear_main(flow_entry_t *e) {
     }
   }
 
-  if (WRITE_TO_CSV) write_to_csv(e);
+  if (WRITE_TO_CSV)
+    write_to_csv(e);
 
   if (SHOW_OUTPUT) {
     char ca[INET_ADDRSTRLEN], sa[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &e->cli_ip, ca, sizeof ca);
     inet_ntop(AF_INET, &e->srv_ip, sa, sizeof sa);
-    fprintf(stderr, "Flow %s:%u ↔ %s:%u %s pkts:%d\n",
-            ca, e->cli_port, sa, e->srv_port, e->is_udp ? "UDP" : "TCP", e->count);
+    fprintf(stderr, "Flow %s:%u ↔ %s:%u %s pkts:%d\n", ca, e->cli_port, sa, e->srv_port, e->is_udp ? "UDP" : "TCP",
+            e->count);
   }
 
   enqueue_flow(e);
@@ -546,11 +535,10 @@ static void drop_and_clear_aux(flow_entry_t *e) {
 }
 
 /* ================================================================= */
-/*                 timing-wheel advance logic (UDP-only expiry)        */
+/*                 timing-wheel advance logic (UDP-only)              */
 /* ================================================================= */
 
 static void expire_slot_lists(int slot) {
-  /* expire UDP main */
   int idx = tw_head_udp_main[slot];
   tw_head_udp_main[slot] = -1;
   while (idx != -1) {
@@ -560,7 +548,6 @@ static void expire_slot_lists(int slot) {
     idx = nxt;
   }
 
-  /* expire UDP aux */
   idx = tw_head_udp_aux[slot];
   tw_head_udp_aux[slot] = -1;
   while (idx != -1) {
@@ -574,7 +561,8 @@ static void expire_slot_lists(int slot) {
 static void tw_advance(time_t now_sec) {
   g_in_tw = 1;
   g_tw_now_arg = (sig_atomic_t)now_sec;
-  if (!tw_initialised) tw_init(now_sec);
+  if (!tw_initialised)
+    tw_init(now_sec);
 
   if (now_sec <= tw_now_sec) {
     g_in_tw = 0;
@@ -583,22 +571,19 @@ static void tw_advance(time_t now_sec) {
 
   time_t delta = now_sec - tw_now_sec;
   if (delta > 10) {
-    fprintf(stderr, "tw_advance: tw_now_sec=%ld now_sec=%ld delta=%ld\n",
-            (long)tw_now_sec, (long)now_sec, (long)delta);
+    fprintf(stderr, "tw_advance: tw_now_sec=%ld now_sec=%ld delta=%ld\n", (long)tw_now_sec, (long)now_sec, (long)delta);
   }
 
-  /* BIG JUMP: if we jumped >= full wheel, everything UDP expires */
   if (delta >= TW_SLOTS) {
     for (int s = 0; s < TW_SLOTS; ++s) {
       expire_slot_lists(s);
     }
-    tw_now_sec  = now_sec;
+    tw_now_sec = now_sec;
     tw_now_slot = (int)(now_sec % TW_SLOTS);
     g_in_tw = 0;
     return;
   }
 
-  /* SMALL JUMP: step normally */
   while (tw_now_sec < now_sec) {
     tw_now_sec++;
     tw_now_slot = (tw_now_slot + 1) & (TW_SLOTS - 1);
@@ -612,16 +597,17 @@ static void tw_advance(time_t now_sec) {
 /*                 ML feature extraction (matches training)           */
 /* ================================================================= */
 
-static void stats_1d(const double *a, int n,
-                     double *out_mean, double *out_std,
-                     double *out_min, double *out_max, double *out_sum) {
+static void stats_1d(const double *a, int n, double *out_mean, double *out_std, double *out_min, double *out_max,
+                     double *out_sum) {
   double sum = 0.0;
   double mn = a[0], mx = a[0];
   for (int i = 0; i < n; i++) {
     double v = a[i];
     sum += v;
-    if (v < mn) mn = v;
-    if (v > mx) mx = v;
+    if (v < mn)
+      mn = v;
+    if (v > mx)
+      mx = v;
   }
   double mean = sum / (double)n;
 
@@ -630,28 +616,31 @@ static void stats_1d(const double *a, int n,
     double d = a[i] - mean;
     var += d * d;
   }
-  var /= (double)n; /* numpy.std default (population) */
+  var /= (double)n;
   double std = (var > 0.0) ? sqrt(var) : 0.0;
 
   *out_mean = mean;
-  *out_std  = std;
-  *out_min  = mn;
-  *out_max  = mx;
-  *out_sum  = sum;
+  *out_std = std;
+  *out_min = mn;
+  *out_max = mx;
+  *out_sum = sum;
 }
 
 static int build_feature_entries_first8(const flow_entry_t *e, union Entry *x, int32_t nfeat) {
-  if (e->count < FIRST_N) return 0;
-  if (nfeat != 27) return 0;
+  if (e->count < FIRST_N)
+    return 0;
+  if (nfeat != 27)
+    return 0;
 
   double t[8], s[8];
   for (int i = 0; i < 8; i++) {
     t[i] = tv_to_sec(&e->ts[i]);
-    s[i] = dabs((double)e->len[i]); /* training used positive sizes */
+    s[i] = dabs((double)e->len[i]);
   }
 
   double dt[7];
-  for (int i = 0; i < 7; i++) dt[i] = t[i + 1] - t[i];
+  for (int i = 0; i < 7; i++)
+    dt[i] = t[i + 1] - t[i];
 
   double span = t[7] - t[0];
   const double eps = 1e-9;
@@ -671,9 +660,10 @@ static int build_feature_entries_first8(const flow_entry_t *e, union Entry *x, i
   }
 
   int k = 0;
-
-  for (int i = 0; i < 8; i++) x[k++].fvalue = s[i];
-  for (int i = 0; i < 7; i++) x[k++].fvalue = dt[i];
+  for (int i = 0; i < 8; i++)
+    x[k++].fvalue = s[i];
+  for (int i = 0; i < 7; i++)
+    x[k++].fvalue = dt[i];
 
   x[k++].fvalue = mean_size;
   x[k++].fvalue = std_size;
@@ -695,14 +685,16 @@ static int build_feature_entries_first8(const flow_entry_t *e, union Entry *x, i
 
 static inline double score_reach40(const flow_entry_t *e) {
   st_predict_calls++;
-  int32_t nfeat = get_num_feature(); /* should be 27 */
+  int32_t nfeat = get_num_feature();
   union Entry xbuf[32];
-  if (nfeat != 27) return 1.0; /* fail-open */
+  if (nfeat != 27)
+    return 1.0;
 
-  if (!build_feature_entries_first8(e, xbuf, nfeat)) return 1.0;
+  if (!build_feature_entries_first8(e, xbuf, nfeat))
+    return 1.0;
 
   double out[1] = {0.0};
-  predict(xbuf, /*pred_margin=*/0, out);
+  predict(xbuf, 0, out);
   postprocess(out);
   return out[0];
 }
@@ -714,57 +706,54 @@ static inline int keep_yesno(const flow_entry_t *e) {
 }
 
 /* ================================================================= */
-/*                 Contention resolution (generic over tables)         */
+/*                 Contention resolution (generic)                    */
 /* ================================================================= */
 
 static void reschedule_udp_if_needed(flow_entry_t *base, int *tw_head, flow_entry_t *e, time_t now_sec) {
-  if (!e->in_use) return;
-  if (!e->is_udp) return;
+  if (!e->in_use)
+    return;
+  if (!e->is_udp)
+    return;
   int idx = idx_of(base, e);
   tw_insert_generic(base, tw_head, idx, now_sec + UDP_IDLE_SEC);
 }
 
-static void swap_main_aux_bucket_generic(flow_entry_t *main_base,
-                                         flow_entry_t *aux_base,
-                                         int *tw_head_main,   /* NULL for TCP */
-                                         int *tw_head_aux,    /* NULL for TCP */
-                                         uint32_t p,
-                                         time_t now_sec)
-{
-  flow_entry_t tmp = main_base[p];
-  main_base[p] = aux_base[p];
-  aux_base[p]  = tmp;
+/* UPDATED: swap uses two indices (main vs aux). */
+static void swap_main_aux_bucket_generic(flow_entry_t *main_base, flow_entry_t *aux_base, int *tw_head_main, int *tw_head_aux,
+                                         uint32_t p_main, uint32_t p_aux, time_t now_sec) {
+  flow_entry_t tmp = main_base[p_main];
+  main_base[p_main] = aux_base[p_aux];
+  aux_base[p_aux] = tmp;
 
   /* Only UDP tables participate in the timing wheel. */
   if (tw_head_main && tw_head_aux) {
-    main_base[p].tw_slot = main_base[p].tw_next = -1;
-    aux_base[p].tw_slot  = aux_base[p].tw_next  = -1;
+    main_base[p_main].tw_slot = main_base[p_main].tw_next = main_base[p_main].tw_prev = -1;
+    aux_base[p_aux].tw_slot = aux_base[p_aux].tw_next = aux_base[p_aux].tw_prev = -1;
 
-    reschedule_udp_if_needed(main_base, tw_head_main, &main_base[p], now_sec);
-    reschedule_udp_if_needed(aux_base,  tw_head_aux,  &aux_base[p],  now_sec);
+    reschedule_udp_if_needed(main_base, tw_head_main, &main_base[p_main], now_sec);
+    reschedule_udp_if_needed(aux_base, tw_head_aux, &aux_base[p_aux], now_sec);
   }
 
   st_swaps++;
 }
 
-static void resolve_duel_bucket_generic(flow_entry_t *main_base,
-                                        flow_entry_t *aux_base,
-                                        int *tw_head_main,  /* NULL for TCP */
-                                        int *tw_head_aux,   /* NULL for TCP */
-                                        uint32_t p,
-                                        time_t now_sec)
-{
-  flow_entry_t *m = &main_base[p];
-  flow_entry_t *a = &aux_base[p];
-  if (!m->in_use || !a->in_use) return;
+/* UPDATED: duel uses two indices (main vs aux). */
+static void resolve_duel_bucket_generic(flow_entry_t *main_base, flow_entry_t *aux_base, int *tw_head_main, int *tw_head_aux,
+                                        uint32_t p_main, uint32_t p_aux, time_t now_sec) {
+  flow_entry_t *m = &main_base[p_main];
+  flow_entry_t *a = &aux_base[p_aux];
+  if (!m->in_use || !a->in_use)
+    return;
 
-  /* If aux reached FIRST_N and main didn't, swap them */
+  /* Safety: don't "duel" if they are actually the same key. */
+  if (!compare_key(&m->key, &a->key))
+    return;
+
   if (a->count >= FIRST_N && m->count < FIRST_N) {
-    swap_main_aux_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p, now_sec);
+    swap_main_aux_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, now_sec);
     return;
   }
 
-  /* If both reached FIRST_N, score and decide */
   if (m->count >= FIRST_N && a->count >= FIRST_N) {
     st_duels++;
 
@@ -772,29 +761,30 @@ static void resolve_duel_bucket_generic(flow_entry_t *main_base,
     int a_keep = keep_yesno(a);
 
     int keep_main;
-    if (m_keep && !a_keep) keep_main = 1;
-    else if (!m_keep && a_keep) keep_main = 0;
-    else keep_main = coinflip();
+    if (m_keep && !a_keep)
+      keep_main = 1;
+    else if (!m_keep && a_keep)
+      keep_main = 0;
+    else
+      keep_main = coinflip();
 
     if (!keep_main) {
-      swap_main_aux_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p, now_sec);
+      swap_main_aux_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, now_sec);
       st_aux_wins++;
     } else {
       st_main_wins++;
     }
 
-    /* drop loser (now in aux_base[p]) */
-    drop_and_clear_aux(&aux_base[p]);
+    /* drop loser (now in aux slot) */
+    drop_and_clear_aux(&aux_base[p_aux]);
   }
 }
 
 /* ================================================================= */
-/*                 packet tracking (called per packet)               */
+/*                 packet tracking (called per packet)                */
 /* ================================================================= */
 
-static void init_new_entry(flow_entry_t *e, flow_key_t key,
-                           uint32_t sip, uint32_t dip,
-                           uint16_t sport, uint16_t dport,
+static void init_new_entry(flow_entry_t *e, flow_key_t key, uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport,
                            uint8_t proto) {
   memset(e, 0, sizeof *e);
   e->in_use = 1;
@@ -809,11 +799,10 @@ static void init_new_entry(flow_entry_t *e, flow_key_t key,
   e->tw_slot = e->tw_next = e->tw_prev = -1;
 }
 
-static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
-                         uint16_t sport, uint16_t dport, uint8_t proto,
-                         int tcp_syn, int tcp_fin, uint16_t ip_len)
-{
-  /* If requested, dump counts across all four tables. */
+static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport,
+                         uint8_t proto, int tcp_syn, int tcp_fin, uint16_t ip_len) {
+  (void)tcp_fin;
+
   if (g_sigquit_dump_full) {
     g_sigquit_dump_full = 0;
 
@@ -821,82 +810,88 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
     int udp_main = 0, udp_aux = 0;
 
     for (int i = 0; i < TABLE_SIZE; i++) {
-      if (table_tcp[i].in_use) tcp_main++;
-      if (aux_tcp[i].in_use)   tcp_aux++;
-      if (table_udp[i].in_use) udp_main++;
-      if (aux_udp[i].in_use)   udp_aux++;
+      if (table_tcp[i].in_use)
+        tcp_main++;
+      if (table_udp[i].in_use)
+        udp_main++;
+    }
+    for (int i = 0; i < TCP_AUX_SIZE; i++) {
+      if (aux_tcp[i].in_use)
+        tcp_aux++;
+    }
+    for (int i = 0; i < UDP_AUX_SIZE; i++) {
+      if (aux_udp[i].in_use)
+        udp_aux++;
     }
 
-    fprintf(stderr,
-      "ACTIVE: tcp_main=%d tcp_aux=%d udp_main=%d udp_aux=%d (tw_now=%ld slot=%d)\n",
-      tcp_main, tcp_aux, udp_main, udp_aux,
-      (long)tw_now_sec, tw_now_slot);
+    fprintf(stderr, "ACTIVE: tcp_main=%d tcp_aux=%d udp_main=%d udp_aux=%d (tw_now=%ld slot=%d)\n", tcp_main, tcp_aux,
+            udp_main, udp_aux, (long)tw_now_sec, tw_now_slot);
   }
 
-  /* Timing wheel must advance on ALL packets so UDP expiry stays correct. */
   tw_advance(tv->tv_sec);
 
   flow_key_t key = make_key(sip, dip, sport, dport, proto);
 
   char kbuf[64];
-  snprintf(kbuf, sizeof kbuf, "%08x%04x%08x%04x%02x",
-           key.ip1, key.port1, key.ip2, key.port2, key.proto);
+  snprintf(kbuf, sizeof kbuf, "%08x%04x%08x%04x%02x", key.ip1, key.port1, key.ip2, key.port2, key.proto);
   uint32_t h = fnv1a_32(kbuf);
-  uint32_t p = h & (TABLE_SIZE - 1);
 
-  /*
-   * CHANGE: select which table-set we are using.
-   *  - UDP goes to (table_udp, aux_udp) + timing wheel heads
-   *  - TCP goes to (table_tcp, aux_tcp) and uses no wheel heads
-   */
+  /* Correct protocol-specific indexing */
+  uint32_t p_main = h & (TABLE_SIZE - 1);
+  uint32_t p_aux = (proto == IPPROTO_UDP) ? (h & (UDP_AUX_SIZE - 1)) : (h & (TCP_AUX_SIZE - 1));
+
   flow_entry_t *main_base;
   flow_entry_t *aux_base;
   int *tw_head_main = NULL;
-  int *tw_head_aux  = NULL;
+  int *tw_head_aux = NULL;
 
   if (proto == IPPROTO_UDP) {
     main_base = table_udp;
-    aux_base  = aux_udp;
+    aux_base = aux_udp;
     tw_head_main = tw_head_udp_main;
-    tw_head_aux  = tw_head_udp_aux;
+    tw_head_aux = tw_head_udp_aux;
   } else {
     main_base = table_tcp;
-    aux_base  = aux_tcp;
-    /* TCP: no timing wheel */
+    aux_base = aux_tcp;
   }
 
-  flow_entry_t *m = &main_base[p];
-  flow_entry_t *a = &aux_base[p];
+  flow_entry_t *m = &main_base[p_main];
+  flow_entry_t *a = &aux_base[p_aux];
 
-  /* Determine whether packet belongs to main, aux, or is a new contender */
   flow_entry_t *e = NULL;
   int is_new = 0;
   int is_aux = 0;
 
   if (!m->in_use) {
-    e = m; is_new = 1; is_aux = 0;
+    e = m;
+    is_new = 1;
+    is_aux = 0;
   } else if (!compare_key(&m->key, &key)) {
-    e = m; is_new = 0; is_aux = 0;
+    e = m;
+    is_new = 0;
+    is_aux = 0;
   } else {
     /* collision with main */
     if (!a->in_use) {
-      e = a; is_new = 1; is_aux = 1;
+      e = a;
+      is_new = 1;
+      is_aux = 1;
     } else if (!compare_key(&a->key, &key)) {
-      e = a; is_new = 0; is_aux = 1;
+      e = a;
+      is_new = 0;
+      is_aux = 1;
     } else {
-      /* third contender */
       st_aux_third_dropped++;
       return;
     }
   }
 
   if (is_new) {
-    /* no mid-flow TCP for new flows */
-    if (proto == IPPROTO_TCP && !tcp_syn) return;
+    if (proto == IPPROTO_TCP && !tcp_syn)
+      return;
 
-    /* UDP-only Bloom gate: refuse to create new UDP entries for "probably seen" flows */
     if (proto == IPPROTO_UDP) {
-      int seen = udp_bloom_probably_seen_and_maybe_add(&key, /*add_if_new=*/1);
+      int seen = udp_bloom_probably_seen_and_maybe_add(&key, 1);
       if (seen) {
         st_udp_bloom_refused++;
         return;
@@ -904,14 +899,17 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
     }
 
     init_new_entry(e, key, sip, dip, sport, dport, proto);
-    if (is_aux) st_aux_inserted++;
-    else st_flows_inserted++;
+    if (is_aux)
+      st_aux_inserted++;
+    else
+      st_flows_inserted++;
   } else {
-    if (is_aux) st_aux_matched++;
-    else st_flows_matched++;
+    if (is_aux)
+      st_aux_matched++;
+    else
+      st_flows_matched++;
   }
 
-  /* Track packet */
   if (e->count < FLOW_CAP) {
     int from_cli = (sip == e->cli_ip && sport == e->cli_port);
     e->ts[e->count] = *tv;
@@ -920,40 +918,32 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
     st_packets_tracked++;
   }
 
-  /* UDP: reschedule in whichever table it is in (UDP-only wheel) */
+  /* UDP: reschedule using correct index for whichever table the entry lives in */
   if (e->is_udp) {
-    if (is_aux) tw_insert_generic(aux_base,  tw_head_aux,  (int)p, tv->tv_sec + UDP_IDLE_SEC);
-    else        tw_insert_generic(main_base, tw_head_main, (int)p, tv->tv_sec + UDP_IDLE_SEC);
+    if (is_aux)
+      tw_insert_generic(aux_base, tw_head_aux, (int)p_aux, tv->tv_sec + UDP_IDLE_SEC);
+    else
+      tw_insert_generic(main_base, tw_head_main, (int)p_main, tv->tv_sec + UDP_IDLE_SEC);
   }
 
-  /* If main reaches FLOW_CAP, flush it (same behavior as original). */
   if (!is_aux && e->count == FLOW_CAP) {
     dump_and_clear_main(e);
     return;
   }
 
-  /* Contention-aware ML arbitration */
-  if (m->in_use && a->in_use) {
-    resolve_duel_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p, tv->tv_sec);
+  /* Duel only if both occupied and not same key */
+  if (m->in_use && a->in_use && compare_key(&m->key, &a->key)) {
+    resolve_duel_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, tv->tv_sec);
   }
-
-  (void)tcp_fin; /* kept in signature for future FIN logic if you re-enable it */
 }
 
 /* ================================================================= */
 /*                parse Ethernet/IP/TCP/UDP & call tracker            */
 /* ================================================================= */
 static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
-
-  static time_t prev = 0;
-  if (prev && h->ts.tv_sec - prev > 10) {
-    fprintf(stderr, "TS JUMP %ld -> %ld (Δ=%ld)\n",
-            (long)prev, (long)h->ts.tv_sec, (long)(h->ts.tv_sec - prev));
-  }
-  prev = h->ts.tv_sec;
-
   const struct ether_header *eth = (const struct ether_header *)pkt;
-  if (ntohs(eth->ether_type) != ETHERTYPE_IP) return 0;
+  if (ntohs(eth->ether_type) != ETHERTYPE_IP)
+    return 0;
 
   const struct ip *ip = (const struct ip *)(pkt + sizeof *eth);
   uint8_t proto = ip->ip_p;
@@ -990,59 +980,44 @@ static void on_sigquit(int sig) {
 
   char buf[256];
   int n = snprintf(buf, sizeof(buf),
-    "\n=== SIGQUIT RECEIVED ===\n"
-    "in_tw=%d tw_arg=%d tw_now_sec=%ld slot=%d\n"
-    "... duels=%" PRIu64 " keep_calls=%" PRIu64 " predict_calls=%" PRIu64 "\n"
-    "ZMQ fill=%zu exiting=%d\n",
-    (int)g_in_tw, (int)g_tw_now_arg, (long)tw_now_sec, tw_now_slot,
-    st_duels, st_keep_calls, st_predict_calls,
-    fill, exiting);
-  if (n > 0) (void)write(STDERR_FILENO, buf, (size_t)n);
+                   "\n=== SIGQUIT RECEIVED ===\n"
+                   "in_tw=%d tw_arg=%d tw_now_sec=%ld slot=%d\n"
+                   "... duels=%" PRIu64 " keep_calls=%" PRIu64 " predict_calls=%" PRIu64 "\n"
+                   "ZMQ fill=%zu exiting=%d\n",
+                   (int)g_in_tw, (int)g_tw_now_arg, (long)tw_now_sec, tw_now_slot, st_duels, st_keep_calls,
+                   st_predict_calls, fill, exiting);
+
+  if (n > 0) {
+    ssize_t wr = write(STDERR_FILENO, buf, (size_t)n);
+    (void)wr;
+  }
 }
 
+/* Optional debug dump (currently unused) */
 static void dump_active_flows(time_t now_sec) {
   int tcp_main = 0, tcp_aux = 0;
   int udp_main = 0, udp_aux = 0;
 
-  fprintf(stderr, "\n=== DUMP ACTIVE FLOWS (now=%ld, tw_now=%ld slot=%d) ===\n",
-          (long)now_sec, (long)tw_now_sec, tw_now_slot);
+  fprintf(stderr, "\n=== DUMP ACTIVE FLOWS (now=%ld, tw_now=%ld slot=%d) ===\n", (long)now_sec, (long)tw_now_sec,
+          tw_now_slot);
 
-  int shown = 0;
-  const int MAX_SHOW = 50;
-
-  for (int i = 0; i < UDP_AUX_SIZE; ++i) {
-    if (table_tcp[i].in_use) {
+  for (int i = 0; i < TABLE_SIZE; ++i) {
+    if (table_tcp[i].in_use)
       tcp_main++;
-      if (shown < MAX_SHOW) {
-        char ca[INET_ADDRSTRLEN], sa[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &table_tcp[i].cli_ip, ca, sizeof ca);
-        inet_ntop(AF_INET, &table_tcp[i].srv_ip, sa, sizeof sa);
-        fprintf(stderr, "TCP_MAIN[%d] %s:%u ↔ %s:%u cnt=%d\n",
-                i, ca, table_tcp[i].cli_port, sa, table_tcp[i].srv_port, table_tcp[i].count);
-        shown++;
-      }
-    }
-    if (aux_tcp[i].in_use) tcp_aux++;
-
-    if (table_udp[i].in_use) {
+    if (table_udp[i].in_use)
       udp_main++;
-      if (shown < MAX_SHOW) {
-        char ca[INET_ADDRSTRLEN], sa[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &table_udp[i].cli_ip, ca, sizeof ca);
-        inet_ntop(AF_INET, &table_udp[i].srv_ip, sa, sizeof sa);
-        fprintf(stderr, "UDP_MAIN[%d] %s:%u ↔ %s:%u cnt=%d tw_slot=%d\n",
-                i, ca, table_udp[i].cli_port, sa, table_udp[i].srv_port,
-                table_udp[i].count, table_udp[i].tw_slot);
-        shown++;
-      }
-    }
-    if (aux_udp[i].in_use) udp_aux++;
+  }
+  for (int i = 0; i < TCP_AUX_SIZE; ++i) {
+    if (aux_tcp[i].in_use)
+      tcp_aux++;
+  }
+  for (int i = 0; i < UDP_AUX_SIZE; ++i) {
+    if (aux_udp[i].in_use)
+      udp_aux++;
   }
 
-  fprintf(stderr, "Totals: tcp_main=%d tcp_aux=%d udp_main=%d udp_aux=%d\n",
-          tcp_main, tcp_aux, udp_main, udp_aux);
-  fprintf(stderr, "ZMQ buffer: fill=%zu head=%zu tail=%zu exiting=%d\n",
-          fill, head, tail, exiting);
+  fprintf(stderr, "Totals: tcp_main=%d tcp_aux=%d udp_main=%d udp_aux=%d\n", tcp_main, tcp_aux, udp_main, udp_aux);
+  fprintf(stderr, "ZMQ buffer: fill=%zu head=%zu tail=%zu exiting=%d\n", fill, head, tail, exiting);
   fprintf(stderr, "UDP bloom refused new entries: %" PRIu64 "\n", st_udp_bloom_refused);
   fprintf(stderr, "=== END DUMP ===\n\n");
 }
@@ -1055,18 +1030,14 @@ int main(int argc, char **argv) {
     fprintf(stderr, "usage: %s file.pcap\n", argv[0]);
     return 1;
   }
-  signal(SIGQUIT, on_sigquit);  /* Ctrl+\ */
+  signal(SIGQUIT, on_sigquit);
 
-  /* sanity: model expects 27 features for first_n=8 */
   if (get_num_feature() != 27) {
-    fprintf(stderr, "ERROR: model expects %d features, but this program assumes 27 (first_n=8)\n",
-            (int)get_num_feature());
+    fprintf(stderr, "ERROR: model expects %d features, but this program assumes 27 (first_n=8)\n", (int)get_num_feature());
     return 1;
   }
 
   srand((unsigned)time(NULL));
-
-  /* init UDP bloom */
   udp_bloom_clear();
 
   char err[PCAP_ERRBUF_SIZE];
@@ -1096,41 +1067,41 @@ int main(int argc, char **argv) {
     if (rc == 0) {
       zeros++;
       if ((zeros % 100000ULL) == 0) {
-        fprintf(stderr, "pcap_next_ex: rc==0 zeros=%" PRIu64 " iters=%" PRIu64 "\n",
-                zeros, iters);
+        fprintf(stderr, "pcap_next_ex: rc==0 zeros=%" PRIu64 " iters=%" PRIu64 "\n", zeros, iters);
       }
       continue;
     }
 
     pkts++;
     if ((pkts % 10000ULL) == 0) {
-      fprintf(stderr, "pcap: pkts=%" PRIu64 " iters=%" PRIu64 " last_ts=%ld\n",
-              pkts, iters, (long)h->ts.tv_sec);
+      fprintf(stderr, "pcap: pkts=%" PRIu64 " iters=%" PRIu64 " last_ts=%ld\n", pkts, iters, (long)h->ts.tv_sec);
     }
 
     parse_and_track(h, pkt);
   }
 
-  if (rc == -1) fprintf(stderr, "pcap error: %s\n", pcap_geterr(pc));
+  if (rc == -1)
+    fprintf(stderr, "pcap error: %s\n", pcap_geterr(pc));
   fprintf(stderr, "main: pcap loop done rc=%d\n", rc);
 
-  /* final flush: advance far enough to expire all UDP flows */
   if (last_pcap_sec != 0) {
     tw_advance(last_pcap_sec + UDP_IDLE_SEC + TW_SLOTS);
   }
 
-  /*
-   * flush BOTH main tables (TCP + UDP).
-   * Aux remains "drop silently" for both.
-   */
   for (int i = 0; i < TABLE_SIZE; ++i) {
-    if (table_tcp[i].in_use) dump_and_clear_main(&table_tcp[i]);
-    if (table_udp[i].in_use) dump_and_clear_main(&table_udp[i]);
+    if (table_tcp[i].in_use)
+      dump_and_clear_main(&table_tcp[i]);
+    if (table_udp[i].in_use)
+      dump_and_clear_main(&table_udp[i]);
   }
 
+  for (int i = 0; i < TCP_AUX_SIZE; ++i) {
+    if (aux_tcp[i].in_use)
+      drop_and_clear_aux(&aux_tcp[i]);
+  }
   for (int i = 0; i < UDP_AUX_SIZE; ++i) {
-    if (aux_tcp[i].in_use) drop_and_clear_aux(&aux_tcp[i]);
-    if (aux_udp[i].in_use) drop_and_clear_aux(&aux_udp[i]);
+    if (aux_udp[i].in_use)
+      drop_and_clear_aux(&aux_udp[i]);
   }
 
   pthread_mutex_lock(&mtx);
@@ -1149,11 +1120,8 @@ int main(int argc, char **argv) {
           " pkts_tracked=%" PRIu64
           " duels=%" PRIu64 " swaps=%" PRIu64 " main_wins=%" PRIu64 " aux_wins=%" PRIu64
           " udp_bloom_refused=%" PRIu64 "\n",
-          st_flows_inserted, st_flows_matched,
-          st_aux_inserted, st_aux_matched, st_aux_third_dropped,
-          st_packets_tracked,
-          st_duels, st_swaps, st_main_wins, st_aux_wins,
-          st_udp_bloom_refused);
+          st_flows_inserted, st_flows_matched, st_aux_inserted, st_aux_matched, st_aux_third_dropped, st_packets_tracked,
+          st_duels, st_swaps, st_main_wins, st_aux_wins, st_udp_bloom_refused);
 
   return 0;
 }
