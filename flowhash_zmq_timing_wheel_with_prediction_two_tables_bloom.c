@@ -54,7 +54,7 @@
 #include "../rf_first8_40packets_build/header.h"
 
 /* ---------- parameters ------------------------------------------- */
-#define TABLE_SIZE (65536 * 2) /* must be power of 2 */
+#define TABLE_SIZE (8192) /* must be power of 2 */
 #define FLOW_CAP 40            /* pkts per flow      */
 #define FIRST_N 8              /* packets used by model */
 #define UDP_IDLE_SEC 30        /* idle timeout UDP   */
@@ -75,7 +75,7 @@
 /* ---------- UDP Bloom filter (UDP-only admission gate) ------------ */
 /* Tune these for your workload. Bigger = fewer false positives.      */
 /* Bits must be power-of-two for fast masking.                        */
-#define UDP_BLOOM_BITS   (1u << 27)   /* 134,217,728 bits  (~16 MB) */
+#define UDP_BLOOM_BITS   (1u << 28)   /* 134,217,728 bits  (~16 MB) */
 #define UDP_BLOOM_BYTES  (UDP_BLOOM_BITS / 8u)
 /* How many hash functions (k). 4 is a good practical compromise. */
 #define UDP_BLOOM_K 4
@@ -203,11 +203,11 @@ static inline int udp_bloom_probably_seen_and_maybe_add(const flow_key_t *k, int
 
 /* TCP-only tables */
 static flow_entry_t table_tcp[TABLE_SIZE] = {0};
-static flow_entry_t aux_tcp[TABLE_SIZE]   = {0};
+static flow_entry_t aux_tcp[TABLE_SIZE / 4]   = {0};
 
 /* UDP-only tables */
 static flow_entry_t table_udp[TABLE_SIZE] = {0};
-static flow_entry_t aux_udp[TABLE_SIZE]   = {0};
+static flow_entry_t aux_udp[TABLE_SIZE / 4]   = {0};
 
 /* ================================================================= */
 /*                           Timing-wheel (UDP-only)                  */

@@ -49,7 +49,7 @@
 #include <zmq.h>
 
 /* ---------- parameters ------------------------------------------- */
-#define TABLE_SIZE (65536 * 2) /* must be power of 2 */
+#define TABLE_SIZE (8192) /* must be power of 2 */
 #define FLOW_CAP 40            /* pkts per flow      */
 #define UDP_IDLE_SEC 30        /* idle timeout UDP   */
 #define TW_SLOTS 256           /* must be power of 2 */
