@@ -63,6 +63,10 @@
 #define BATCH_SIZE 16          /* flows per JSON msg */
 #define SHOW_OUTPUT 0          /* stderr debug prints */
 #define WRITE_TO_CSV 1
+#define UDP_MAIN_SIZE  (TABLE_SIZE)
+#define UDP_AUX_SIZE   (TABLE_SIZE / 4)
+#define TCP_MAIN_SIZE  (TABLE_SIZE)   /* if you have a tcp table too */
+#define TCP_AUX_SIZE   (TABLE_SIZE / 4) /* if applicable */
 
 /* ML gate */
 #define EVICT_THRESHOLD 0.50   /* threshold for yes/no */
@@ -203,11 +207,11 @@ static inline int udp_bloom_probably_seen_and_maybe_add(const flow_key_t *k, int
 
 /* TCP-only tables */
 static flow_entry_t table_tcp[TABLE_SIZE] = {0};
-static flow_entry_t aux_tcp[TABLE_SIZE / 4]   = {0};
+static flow_entry_t aux_tcp[TCP_AUX_SIZE]   = {0};
 
 /* UDP-only tables */
 static flow_entry_t table_udp[TABLE_SIZE] = {0};
-static flow_entry_t aux_udp[TABLE_SIZE / 4]   = {0};
+static flow_entry_t aux_udp[UDP_AUX_SIZE] = {0};
 
 /* ================================================================= */
 /*                           Timing-wheel (UDP-only)                  */
@@ -532,7 +536,7 @@ static void dump_and_clear_main(flow_entry_t *e) {
 
 static void drop_and_clear_aux(flow_entry_t *e) {
   if (e->is_udp) {
-    if (e >= &aux_udp[0] && e < &aux_udp[TABLE_SIZE]) {
+    if (e >= &aux_udp[0] && e < &aux_udp[UDP_AUX_SIZE]) {
       int idx = idx_of(aux_udp, e);
       tw_remove_generic(aux_udp, tw_head_udp_aux, idx);
     }
@@ -1006,7 +1010,7 @@ static void dump_active_flows(time_t now_sec) {
   int shown = 0;
   const int MAX_SHOW = 50;
 
-  for (int i = 0; i < TABLE_SIZE; ++i) {
+  for (int i = 0; i < UDP_AUX_SIZE; ++i) {
     if (table_tcp[i].in_use) {
       tcp_main++;
       if (shown < MAX_SHOW) {
@@ -1124,7 +1128,7 @@ int main(int argc, char **argv) {
     if (table_udp[i].in_use) dump_and_clear_main(&table_udp[i]);
   }
 
-  for (int i = 0; i < TABLE_SIZE; ++i) {
+  for (int i = 0; i < UDP_AUX_SIZE; ++i) {
     if (aux_tcp[i].in_use) drop_and_clear_aux(&aux_tcp[i]);
     if (aux_udp[i].in_use) drop_and_clear_aux(&aux_udp[i]);
   }
