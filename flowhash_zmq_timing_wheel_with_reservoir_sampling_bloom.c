@@ -65,8 +65,8 @@
 
 /* ---------- UDP Bloom filter (UDP-only admission gate) ------------ */
 /* Bits must be power-of-two for fast masking.                        */
-/* 2^27 bits = 16MB; 2^26 bits = 8MB; 2^25 bits = 4MB                */
-#define UDP_BLOOM_BITS   (1u << 27)
+/* 2^28 bits = 32MB; 2^27 bits = 16MB; 2^26 bits = 8MB; 2^25 bits = 4MB                */
+#define UDP_BLOOM_BITS   (1u << 28)
 #define UDP_BLOOM_BYTES  (UDP_BLOOM_BITS / 8u)
 #define UDP_BLOOM_K 4
 
