@@ -1,13 +1,17 @@
 /*********************************************************************
  *  flowhash_zmq_timing_wheel_with_prediction_two_tables_bloom.c
  *
- *  CHANGE (Feb 2026):
- *   - AUX tables are now 1:1 with MAIN tables (AUX_SIZE == TABLE_SIZE)
- *   - When flows collide in the AUX table (same aux bucket, different key),
- *     keep existing vs replace with newcomer via coin flip.
+ *  Feb 2026 modifications requested:
+ *   1) AUX tables are 1:1 with MAIN (AUX_SIZE == TABLE_SIZE).
+ *      => p_aux == p_main (strict 1:1 indexing).
  *
- *  NOTE:
- *   With AUX_SIZE == TABLE_SIZE, p_aux == p_main (strict 1:1).
+ *   2) If a NEW flow collides in AUX (aux bucket occupied by different key),
+ *      decide which flow to keep by coin flip:
+ *        - heads: replace existing aux entry with newcomer
+ *        - tails: keep existing aux entry, drop newcomer
+ *
+ *   3) Classify (CSV + enqueue/ZMQ) flows that reach FLOW_CAP in AUX as well.
+ *      (Previously only MAIN reaching FLOW_CAP was classified.)
  *********************************************************************/
 
 #define _DEFAULT_SOURCE
@@ -181,11 +185,11 @@ static inline int udp_bloom_probably_seen_and_maybe_add(const flow_key_t *k, int
 
 /* TCP-only tables */
 static flow_entry_t table_tcp[TABLE_SIZE] = {0};
-static flow_entry_t aux_tcp[TABLE_SIZE] = {0}; /* CHANGED: was TCP_AUX_SIZE */
+static flow_entry_t aux_tcp[TABLE_SIZE] = {0};
 
 /* UDP-only tables */
 static flow_entry_t table_udp[TABLE_SIZE] = {0};
-static flow_entry_t aux_udp[TABLE_SIZE] = {0}; /* CHANGED: was UDP_AUX_SIZE */
+static flow_entry_t aux_udp[TABLE_SIZE] = {0};
 
 /* ================================================================= */
 /*                           Timing-wheel (UDP-only)                  */
@@ -511,6 +515,32 @@ static void dump_and_clear_main(flow_entry_t *e) {
   e->tw_slot = e->tw_next = e->tw_prev = -1;
 }
 
+/* NEW: classify + clear AUX entry (CSV + enqueue/ZMQ) */
+static void dump_and_clear_aux_classify(flow_entry_t *e) {
+  if (e->is_udp) {
+    if (e >= &aux_udp[0] && e < &aux_udp[UDP_AUX_SIZE]) {
+      int idx = idx_of(aux_udp, e);
+      tw_remove_generic(aux_udp, tw_head_udp_aux, idx);
+    }
+  }
+
+  if (WRITE_TO_CSV)
+    write_to_csv(e);
+
+  if (SHOW_OUTPUT) {
+    char ca[INET_ADDRSTRLEN], sa[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &e->cli_ip, ca, sizeof ca);
+    inet_ntop(AF_INET, &e->srv_ip, sa, sizeof sa);
+    fprintf(stderr, "Flow(AUX) %s:%u ↔ %s:%u %s pkts:%d\n", ca, e->cli_port, sa, e->srv_port, e->is_udp ? "UDP" : "TCP",
+            e->count);
+  }
+
+  enqueue_flow(e);
+
+  memset(e, 0, sizeof *e);
+  e->tw_slot = e->tw_next = e->tw_prev = -1;
+}
+
 static void drop_and_clear_aux(flow_entry_t *e) {
   if (e->is_udp) {
     if (e >= &aux_udp[0] && e < &aux_udp[UDP_AUX_SIZE]) {
@@ -541,7 +571,7 @@ static void expire_slot_lists(int slot) {
   while (idx != -1) {
     int nxt = aux_udp[idx].tw_next;
     aux_udp[idx].tw_slot = aux_udp[idx].tw_next = -1;
-    drop_and_clear_aux(&aux_udp[idx]);
+    drop_and_clear_aux(&aux_udp[idx]); /* still drop on idle expiry */
     idx = nxt;
   }
 }
@@ -824,7 +854,7 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip, u
   snprintf(kbuf, sizeof kbuf, "%08x%04x%08x%04x%02x", key.ip1, key.port1, key.ip2, key.port2, key.proto);
   uint32_t h = fnv1a_32(kbuf);
 
-  /* CHANGED: AUX is 1:1 with MAIN, so p_aux == p_main */
+  /* AUX is 1:1 with MAIN, so p_aux == p_main */
   uint32_t p_main = h & (TABLE_SIZE - 1);
   uint32_t p_aux = h & (TABLE_SIZE - 1);
 
@@ -869,7 +899,7 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip, u
       is_new = 0;
       is_aux = 1;
     } else {
-      /* CHANGED: collision inside AUX -> keep/replace by coin flip */
+      /* collision inside AUX -> keep/replace by coin flip */
       if (coinflip()) {
         /* replace existing aux flow with newcomer */
         drop_and_clear_aux(a); /* also removes from UDP timing wheel if needed */
@@ -914,6 +944,12 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip, u
     e->len[e->count] = (from_cli ? +1 : -1) * (int32_t)ip_len;
     e->count++;
     st_packets_tracked++;
+  }
+
+  /* NEW: classify AUX entries too when they reach FLOW_CAP */
+  if (is_aux && e->count == FLOW_CAP) {
+    dump_and_clear_aux_classify(e);
+    return;
   }
 
   /* UDP: reschedule using correct index for whichever table the entry lives in */
@@ -1124,4 +1160,5 @@ int main(int argc, char **argv) {
 
   return 0;
 }
+
 
