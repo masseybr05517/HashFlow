@@ -411,7 +411,7 @@ static flow_key_t make_key(uint32_t s_ip, uint32_t d_ip, uint16_t s_pt,
 
 /* challenger replaces incumbent with 50/50 probability */
 static inline int challenger_wins_50_50(void) {
-  return (rand() & 1u) == 0u;
+  return ((uint32_t)rand() % 2u) == 0u;
 }
 
 /* ================================================================= */
