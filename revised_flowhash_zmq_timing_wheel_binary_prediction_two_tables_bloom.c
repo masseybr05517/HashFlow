@@ -1,37 +1,13 @@
 /*********************************************************************
  *  flowhash_zmq_timing_wheel_with_prediction_two_tables_bloom.c
  *
- *  FIX (Feb 2026):
- *   - Correct aux-table indexing when aux tables are smaller than main:
- *       p_main = h & (TABLE_SIZE - 1)
- *       p_aux  = h & (AUX_SIZE  - 1)   (protocol-specific)
- *   - Update all uses of p so we never index aux_* with TABLE_SIZE-range
- *   - Update duel/swap to use (p_main, p_aux)
- *   - Fix SIGQUIT “ACTIVE” table scans to respect correct sizes
- *   - Fix dump_active_flows loops/sizes
- *   - Fix write() warn_unused_result
- *   - Mark dump_active_flows unused (unless you wire it up)
+ *  CHANGE (Feb 2026):
+ *   - AUX tables are now 1:1 with MAIN tables (AUX_SIZE == TABLE_SIZE)
+ *   - When flows collide in the AUX table (same aux bucket, different key),
+ *     keep existing vs replace with newcomer via coin flip.
  *
  *  NOTE:
- *   With AUX_SIZE < TABLE_SIZE, multiple main buckets map to one aux bucket
- *   (p_aux = p_main & (AUX_SIZE-1)). This is safe and works, but it is not a
- *   strict “one aux per main bucket” design. If you want strict 1:1, make
- *   aux tables TABLE_SIZE.
- *
- *  CHANGE (per request, to avoid "2-table 50/50 worse than 1-table 50/50"):
- *   1) REMOVE "third-flow hard drop":
- *        When main+aux both occupied by different keys and a *new third* key arrives,
- *        we *evict one of the two existing contenders (count-based)* to free aux,
- *        then admit the new flow into aux (subject to original admission rules).
- *
- *   2) Reduce churn from constant dueling:
- *        Only duel when BOTH flows have reached FIRST_N packets.
- *
- *   3) Replace ML keep/evict with simple, non-ML policy:
- *        Prefer the flow with higher packet count to stay in MAIN; ties are coinflip.
- *
- *  Everything else (timing wheel behavior, bloom gate, CSV, ZMQ batching, etc.)
- *  remains the same.
+ *   With AUX_SIZE == TABLE_SIZE, p_aux == p_main (strict 1:1).
  *********************************************************************/
 
 #define _DEFAULT_SOURCE
@@ -56,7 +32,7 @@
 #include <unistd.h>
 #include <zmq.h>
 
-/* tl2cgen header (kept as-is; no longer used for eviction) */
+/* tl2cgen header */
 #include "../rf_first8_40packets_build/header.h"
 
 /* ---------- parameters ------------------------------------------- */
@@ -71,11 +47,11 @@
 #define WRITE_TO_CSV 1
 
 #define UDP_MAIN_SIZE (TABLE_SIZE)
-#define UDP_AUX_SIZE (TABLE_SIZE / 4)
+#define UDP_AUX_SIZE (TABLE_SIZE) /* CHANGED: was TABLE_SIZE/4 */
 #define TCP_MAIN_SIZE (TABLE_SIZE)
-#define TCP_AUX_SIZE (TABLE_SIZE / 4)
+#define TCP_AUX_SIZE (TABLE_SIZE) /* CHANGED: was TABLE_SIZE/4 */
 
-/* ML gate (kept; unused now) */
+/* ML gate */
 #define EVICT_THRESHOLD 0.50
 
 /* ZMQ shutdown / blocking behavior */
@@ -100,11 +76,8 @@ static uint8_t udp_bloom[UDP_BLOOM_BYTES];
 #if (UDP_BLOOM_BITS & (UDP_BLOOM_BITS - 1)) != 0
 #error "UDP_BLOOM_BITS must be a power of two"
 #endif
-#if (UDP_AUX_SIZE & (UDP_AUX_SIZE - 1)) != 0
-#error "UDP_AUX_SIZE must be a power of two (TABLE_SIZE/4 is OK if TABLE_SIZE is power of two)"
-#endif
-#if (TCP_AUX_SIZE & (TCP_AUX_SIZE - 1)) != 0
-#error "TCP_AUX_SIZE must be a power of two (TABLE_SIZE/4 is OK if TABLE_SIZE is power of two)"
+#if (UDP_AUX_SIZE != TABLE_SIZE) || (TCP_AUX_SIZE != TABLE_SIZE)
+#error "This build expects AUX tables to be TABLE_SIZE (1:1 with main)."
 #endif
 
 /* ---------- tiny FNV-1a 32-bit ------------------------------------ */
@@ -208,11 +181,11 @@ static inline int udp_bloom_probably_seen_and_maybe_add(const flow_key_t *k, int
 
 /* TCP-only tables */
 static flow_entry_t table_tcp[TABLE_SIZE] = {0};
-static flow_entry_t aux_tcp[TCP_AUX_SIZE] = {0};
+static flow_entry_t aux_tcp[TABLE_SIZE] = {0}; /* CHANGED: was TCP_AUX_SIZE */
 
 /* UDP-only tables */
 static flow_entry_t table_udp[TABLE_SIZE] = {0};
-static flow_entry_t aux_udp[UDP_AUX_SIZE] = {0};
+static flow_entry_t aux_udp[TABLE_SIZE] = {0}; /* CHANGED: was UDP_AUX_SIZE */
 
 /* ================================================================= */
 /*                           Timing-wheel (UDP-only)                  */
@@ -233,7 +206,7 @@ static uint64_t st_packets_tracked = 0;
 
 static uint64_t st_aux_inserted = 0;
 static uint64_t st_aux_matched = 0;
-static uint64_t st_aux_third_dropped = 0; /* should now stay ~0 in normal use */
+static uint64_t st_aux_third_dropped = 0;
 
 static uint64_t st_duels = 0;
 static uint64_t st_swaps = 0;
@@ -242,12 +215,10 @@ static uint64_t st_aux_wins = 0;
 
 static uint64_t st_udp_bloom_refused = 0;
 
-/* SIGQUIT debug */
 static volatile sig_atomic_t g_sigquit_dump_full = 0;
 static volatile sig_atomic_t g_in_tw = 0;
 static volatile sig_atomic_t g_tw_now_arg = 0;
 
-/* counters retained */
 static uint64_t st_predict_calls = 0;
 static uint64_t st_keep_calls = 0;
 
@@ -611,7 +582,7 @@ static void tw_advance(time_t now_sec) {
 }
 
 /* ================================================================= */
-/*                 ML feature extraction (kept, unused)               */
+/*                 ML feature extraction (matches training)           */
 /* ================================================================= */
 
 static void stats_1d(const double *a, int n, double *out_mean, double *out_std, double *out_min, double *out_max,
@@ -735,9 +706,9 @@ static void reschedule_udp_if_needed(flow_entry_t *base, int *tw_head, flow_entr
   tw_insert_generic(base, tw_head, idx, now_sec + UDP_IDLE_SEC);
 }
 
-/* UPDATED: swap uses two indices (main vs aux). */
+/* swap uses two indices (main vs aux). */
 static void swap_main_aux_bucket_generic(flow_entry_t *main_base, flow_entry_t *aux_base, int *tw_head_main,
-                                        int *tw_head_aux, uint32_t p_main, uint32_t p_aux, time_t now_sec) {
+                                         int *tw_head_aux, uint32_t p_main, uint32_t p_aux, time_t now_sec) {
   flow_entry_t tmp = main_base[p_main];
   main_base[p_main] = aux_base[p_aux];
   aux_base[p_aux] = tmp;
@@ -754,16 +725,7 @@ static void swap_main_aux_bucket_generic(flow_entry_t *main_base, flow_entry_t *
   st_swaps++;
 }
 
-/* Decide whether MAIN should keep its slot (non-ML): higher count wins, tie coinflip. */
-static inline int keep_main_by_count(const flow_entry_t *m, const flow_entry_t *a) {
-  if (m->count > a->count)
-    return 1;
-  if (m->count < a->count)
-    return 0;
-  return coinflip();
-}
-
-/* UPDATED: duel uses two indices (main vs aux). */
+/* duel uses two indices (main vs aux). */
 static void resolve_duel_bucket_generic(flow_entry_t *main_base, flow_entry_t *aux_base, int *tw_head_main,
                                         int *tw_head_aux, uint32_t p_main, uint32_t p_aux, time_t now_sec) {
   flow_entry_t *m = &main_base[p_main];
@@ -775,19 +737,24 @@ static void resolve_duel_bucket_generic(flow_entry_t *main_base, flow_entry_t *a
   if (!compare_key(&m->key, &a->key))
     return;
 
-  /* Preserve original preference: if aux has matured to FIRST_N and main has not, promote aux. */
   if (a->count >= FIRST_N && m->count < FIRST_N) {
     swap_main_aux_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, now_sec);
-    /* loser (now in aux) is cleared below */
+    return;
   }
 
-  /* Only duel (and potentially evict) when BOTH have reached FIRST_N (reduces churn). */
   if (m->count >= FIRST_N && a->count >= FIRST_N) {
     st_duels++;
 
-    /* non-ML decision */
-    st_keep_calls += 2;
-    int keep_main = keep_main_by_count(m, a);
+    int m_keep = keep_yesno(m);
+    int a_keep = keep_yesno(a);
+
+    int keep_main;
+    if (m_keep && !a_keep)
+      keep_main = 1;
+    else if (!m_keep && a_keep)
+      keep_main = 0;
+    else
+      keep_main = coinflip();
 
     if (!keep_main) {
       swap_main_aux_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, now_sec);
@@ -799,41 +766,6 @@ static void resolve_duel_bucket_generic(flow_entry_t *main_base, flow_entry_t *a
     /* drop loser (now in aux slot) */
     drop_and_clear_aux(&aux_base[p_aux]);
   }
-}
-
-/* Ensure aux slot becomes free by evicting one of (main, aux) using the same duel policy.
- * After this returns, aux[p_aux] will be empty (cleared), and main[p_main] holds the winner.
- */
-static void free_aux_for_third_flow(flow_entry_t *main_base, flow_entry_t *aux_base, int *tw_head_main, int *tw_head_aux,
-                                   uint32_t p_main, uint32_t p_aux, time_t now_sec) {
-  flow_entry_t *m = &main_base[p_main];
-  flow_entry_t *a = &aux_base[p_aux];
-
-  if (!m->in_use || !a->in_use)
-    return;
-
-  /* If aux matured and main not, swap to avoid throwing away the better-started flow. */
-  if (a->count >= FIRST_N && m->count < FIRST_N) {
-    swap_main_aux_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, now_sec);
-    /* old main is now in aux and will be dropped */
-    drop_and_clear_aux(&aux_base[p_aux]);
-    return;
-  }
-
-  /* Otherwise keep the higher-count flow in main (tie coinflip), drop the other (via swap if needed). */
-  st_duels++;
-  st_keep_calls += 2;
-
-  int keep_main = keep_main_by_count(m, a);
-  if (!keep_main) {
-    swap_main_aux_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, now_sec);
-    st_aux_wins++;
-  } else {
-    st_main_wins++;
-  }
-
-  /* clear aux (loser ends up here) */
-  drop_and_clear_aux(&aux_base[p_aux]);
 }
 
 /* ================================================================= */
@@ -892,9 +824,9 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip, u
   snprintf(kbuf, sizeof kbuf, "%08x%04x%08x%04x%02x", key.ip1, key.port1, key.ip2, key.port2, key.proto);
   uint32_t h = fnv1a_32(kbuf);
 
-  /* Correct protocol-specific indexing */
+  /* CHANGED: AUX is 1:1 with MAIN, so p_aux == p_main */
   uint32_t p_main = h & (TABLE_SIZE - 1);
-  uint32_t p_aux = (proto == IPPROTO_UDP) ? (h & (UDP_AUX_SIZE - 1)) : (h & (TCP_AUX_SIZE - 1));
+  uint32_t p_aux = h & (TABLE_SIZE - 1);
 
   flow_entry_t *main_base;
   flow_entry_t *aux_base;
@@ -937,42 +869,25 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip, u
       is_new = 0;
       is_aux = 1;
     } else {
-      /* NEW POLICY: do NOT hard-drop the 3rd flow.
-       * Free aux by evicting one of (main, aux), then insert the new flow into aux.
-       */
-      if (proto == IPPROTO_TCP && !tcp_syn)
-        return;
-
-      if (proto == IPPROTO_UDP) {
-        int seen = udp_bloom_probably_seen_and_maybe_add(&key, 1);
-        if (seen) {
-          st_udp_bloom_refused++;
-          return;
-        }
-      }
-
-      free_aux_for_third_flow(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, tv->tv_sec);
-
-      /* aux should now be empty */
-      if (a->in_use) {
-        /* extremely defensive fallback: if something went wrong, drop */
+      /* CHANGED: collision inside AUX -> keep/replace by coin flip */
+      if (coinflip()) {
+        /* replace existing aux flow with newcomer */
+        drop_and_clear_aux(a); /* also removes from UDP timing wheel if needed */
+        e = a;
+        is_new = 1;
+        is_aux = 1;
+      } else {
+        /* keep existing aux flow; drop newcomer */
         st_aux_third_dropped++;
         return;
       }
-
-      e = a;
-      is_new = 1;
-      is_aux = 1;
-      /* fallthrough to init_new_entry below */
     }
   }
 
   if (is_new) {
-    /* TCP: only create on SYN */
     if (proto == IPPROTO_TCP && !tcp_syn)
       return;
 
-    /* UDP: bloom admission gate (only on brand new flow) */
     if (proto == IPPROTO_UDP) {
       int seen = udp_bloom_probably_seen_and_maybe_add(&key, 1);
       if (seen) {
@@ -1014,8 +929,8 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip, u
     return;
   }
 
-  /* Duel only if both occupied, different keys, and BOTH matured to FIRST_N (reduces churn). */
-  if (m->in_use && a->in_use && compare_key(&m->key, &a->key) && m->count >= FIRST_N && a->count >= FIRST_N) {
+  /* Duel only if both occupied and not same key */
+  if (m->in_use && a->in_use && compare_key(&m->key, &a->key)) {
     resolve_duel_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, tv->tv_sec);
   }
 }
@@ -1102,7 +1017,6 @@ static void dump_active_flows(time_t now_sec) {
   fprintf(stderr, "Totals: tcp_main=%d tcp_aux=%d udp_main=%d udp_aux=%d\n", tcp_main, tcp_aux, udp_main, udp_aux);
   fprintf(stderr, "ZMQ buffer: fill=%zu head=%zu tail=%zu exiting=%d\n", fill, head, tail, exiting);
   fprintf(stderr, "UDP bloom refused new entries: %" PRIu64 "\n", st_udp_bloom_refused);
-  fprintf(stderr, "aux_third_dropped=%" PRIu64 "\n", st_aux_third_dropped);
   fprintf(stderr, "=== END DUMP ===\n\n");
 }
 
@@ -1116,7 +1030,6 @@ int main(int argc, char **argv) {
   }
   signal(SIGQUIT, on_sigquit);
 
-  /* Kept as-is */
   if (get_num_feature() != 27) {
     fprintf(stderr, "ERROR: model expects %d features, but this program assumes 27 (first_n=8)\n",
             (int)get_num_feature());
@@ -1211,3 +1124,4 @@ int main(int argc, char **argv) {
 
   return 0;
 }
+
