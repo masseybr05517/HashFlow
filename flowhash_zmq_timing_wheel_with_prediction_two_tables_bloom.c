@@ -45,7 +45,7 @@
 #include "../rf_first8_40packets_build/header.h"
 
 /* ---------- parameters ------------------------------------------- */
-#define TABLE_SIZE (8192) /* must be power of 2 */
+#define TABLE_SIZE (4096) /* must be power of 2 */
 #define FLOW_CAP 40
 #define FIRST_N 8
 #define UDP_IDLE_SEC 30
@@ -56,9 +56,9 @@
 #define WRITE_TO_CSV 1
 
 #define UDP_MAIN_SIZE (TABLE_SIZE)
-#define UDP_AUX_SIZE (TABLE_SIZE / 4)
+#define UDP_AUX_SIZE (TABLE_SIZE)
 #define TCP_MAIN_SIZE (TABLE_SIZE)
-#define TCP_AUX_SIZE (TABLE_SIZE / 4)
+#define TCP_AUX_SIZE (TABLE_SIZE)
 
 /* ML gate */
 #define EVICT_THRESHOLD 0.50

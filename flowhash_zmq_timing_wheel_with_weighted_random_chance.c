@@ -50,7 +50,7 @@
 #include <zmq.h>
 
 /* ---------- parameters ------------------------------------------- */
-#define TABLE_SIZE (8192)       /* must be power of 2 */
+#define TABLE_SIZE (4096)       /* must be power of 2 */
 #define FLOW_CAP 40             /* pkts per flow      */
 #define EVICT_START_COUNT 30    /* 50/50 until 30; then decreases to 0 by 40 */
 #define UDP_IDLE_SEC 30         /* idle timeout UDP   */
