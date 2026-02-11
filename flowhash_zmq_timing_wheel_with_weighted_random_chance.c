@@ -491,8 +491,8 @@ static void write_to_csv(flow_entry_t *e) {
     (void)snprintf(feature_vector + w, sizeof(feature_vector) - w, "]");
 
   const char *fname = e->is_udp
-    ? "flow_output_timing_wheel_random_udp.csv"
-    : "flow_output_timing_wheel_random_tcp.csv";
+    ? "flow_output_timing_wheel_weighted_random_udp.csv"
+    : "flow_output_timing_wheel_weighted_random_tcp.csv";
 
   FILE *f = fopen(fname, "a");
   if (!f) { perror("fopen"); exit(1); }
