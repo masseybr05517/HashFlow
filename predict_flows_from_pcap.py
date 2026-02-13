@@ -5,6 +5,7 @@ import dpkt
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, Optional, List
+import joblib
 
 FlowKey = Tuple[str, str, int, int, int]  # (src_ip, dst_ip, src_port, dst_port, proto)
 
@@ -71,20 +72,7 @@ def extract_features(state: FlowState, max_pkts: int = 8) -> np.ndarray:
     return np.array(feats, dtype=np.float32)
 
 def load_model(model_path: str):
-    """
-    Plug in your model loader.
-    - sklearn joblib
-    - xgboost.Booster
-    - onnxruntime
-    For now, a dummy model that predicts based on total pkts.
-    """
-    class Dummy:
-        def predict_proba(self, X):
-            # Example: higher prob if pkts > 40 (replace!)
-            pkts = X[:, 2]
-            p = 1.0 / (1.0 + np.exp(-(pkts - 40.0) / 5.0))
-            return np.stack([1 - p, p], axis=1)
-    return Dummy()
+    return joblib.load(model_path)
 
 def main():
     if len(sys.argv) < 3:
