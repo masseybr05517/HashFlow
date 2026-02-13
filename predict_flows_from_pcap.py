@@ -1,88 +1,129 @@
 #!/usr/bin/env python3
+"""
+predict_flows_from_pcap_first8_27.py
+
+PCAP -> flow aggregation (bidirectional, canonical 5-tuple) -> first-8 feature vector (27 dims)
+-> sklearn/joblib model predict_proba -> print top results.
+
+This matches the feature extraction in:
+  build_feature_entries_first8() from your C file:
+    - s[0..7]  = abs(ip_len) for first 8 packets in arrival order
+    - dt[0..6] = t[i+1]-t[i] for first 8 packets
+    - stats over s (n=8): mean, std(pop), min, max, sum
+    - stats over dt (n=7): mean, std(pop), min, max, span
+    - pps_8 = 8/span, bps_8 = sum_size/span (with eps)
+
+Usage:
+  python3 predict_flows_from_pcap_first8_27.py <pcap> <model.joblib> [max_flows] [topk]
+
+Example:
+  python3 predict_flows_from_pcap_first8_27.py newtrace.pcap randforest_first8_predicting40packets.joblib 0 50
+"""
+
 import sys
 import socket
+from dataclasses import dataclass, field
+from typing import Dict, Tuple, List, Optional
+
 import dpkt
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Dict, Tuple, Optional, List
 import joblib
 
-FlowKey = Tuple[str, str, int, int, int]  # (src_ip, dst_ip, src_port, dst_port, proto)
+FlowKey = Tuple[str, str, int, int, int]  # (ip1, ip2, port1, port2, proto)
+
 
 def ip_to_str(ip_bytes: bytes) -> str:
     return socket.inet_ntop(socket.AF_INET, ip_bytes)
+
+
+def canonicalize_flow(src_ip: str, dst_ip: str, sport: int, dport: int, proto: int) -> FlowKey:
+    """
+    Canonical key so both directions map to the same flow.
+    This mirrors your C make_key logic conceptually: order by (ip, then port).
+    """
+    a = (src_ip, dst_ip, sport, dport, proto)
+    b = (dst_ip, src_ip, dport, sport, proto)
+    return a if a <= b else b
+
 
 @dataclass
 class FlowState:
     t_first: float
     t_last: float
-    pkt_lens_fwd: List[int] = field(default_factory=list)
-    pkt_lens_rev: List[int] = field(default_factory=list)
-    ipt_fwd: List[float] = field(default_factory=list)
-    ipt_rev: List[float] = field(default_factory=list)
-    bytes_fwd: int = 0
-    bytes_rev: int = 0
-    pkts_fwd: int = 0
-    pkts_rev: int = 0
-    last_ts_fwd: Optional[float] = None
-    last_ts_rev: Optional[float] = None
+    first_ts: List[float] = field(default_factory=list)     # store first 8 packet timestamps (absolute seconds)
+    first_size: List[float] = field(default_factory=list)   # store first 8 abs(ip_len)
+    pkts: int = 0
+    bytes: int = 0
 
-def canonicalize_flow(src_ip, dst_ip, sport, dport, proto) -> Tuple[FlowKey, bool]:
+
+def stats_1d_pop(a: List[float]) -> Tuple[float, float, float, float, float]:
     """
-    Return (canonical_key, is_fwd)
-    Canonical key is ordered so that both directions map to same key.
-    is_fwd tells you whether this packet is in the canonical forward direction.
+    Returns (mean, std(population), min, max, sum) exactly like your C stats_1d:
+      var = sum((x-mean)^2)/n  (population variance)
     """
-    a = (src_ip, dst_ip, sport, dport, proto)
-    b = (dst_ip, src_ip, dport, sport, proto)
-    if a <= b:
-        return a, True
-    else:
-        return b, False
+    n = len(a)
+    sm = float(sum(a))
+    mn = float(min(a))
+    mx = float(max(a))
+    mean = sm / float(n)
 
-def extract_features(state: FlowState, max_pkts: int = 8) -> np.ndarray:
+    var = 0.0
+    for x in a:
+        d = float(x) - mean
+        var += d * d
+    var /= float(n)
+
+    std = float(np.sqrt(var)) if var > 0.0 else 0.0
+    return mean, std, mn, mx, sm
+
+
+def extract_features_first8_27(state: FlowState) -> Optional[np.ndarray]:
     """
-    EXAMPLE features. Replace with YOUR exact training feature order.
-    Here we build:
-      - duration
-      - total bytes, total pkts
-      - fwd bytes/pkts, rev bytes/pkts
-      - first N fwd lens, first N rev lens (padded)
-      - first N fwd ipt,  first N rev ipt  (padded)
+    Produce the exact 27-dim feature vector used by your C tl2cgen model.
+    Returns None if the flow has fewer than 8 packets observed.
     """
-    duration = max(0.0, state.t_last - state.t_first)
-    total_bytes = state.bytes_fwd + state.bytes_rev
-    total_pkts = state.pkts_fwd + state.pkts_rev
+    if len(state.first_ts) < 8 or len(state.first_size) < 8:
+        return None
 
-    def pad_int(xs):
-        xs = xs[:max_pkts]
-        return xs + [0] * (max_pkts - len(xs))
+    t = state.first_ts[:8]
+    s = state.first_size[:8]
 
-    def pad_float(xs):
-        xs = xs[:max_pkts]
-        return xs + [0.0] * (max_pkts - len(xs))
+    dt = [t[i + 1] - t[i] for i in range(7)]
+    span = t[7] - t[0]
+    eps = 1e-9
 
-    feats = []
-    feats += [duration, float(total_bytes), float(total_pkts)]
-    feats += [float(state.bytes_fwd), float(state.pkts_fwd), float(state.bytes_rev), float(state.pkts_rev)]
-    feats += list(map(float, pad_int(state.pkt_lens_fwd)))
-    feats += list(map(float, pad_int(state.pkt_lens_rev)))
-    feats += pad_float(state.ipt_fwd)
-    feats += pad_float(state.ipt_rev)
+    mean_size, std_size, min_size, max_size, sum_size = stats_1d_pop(s)
+    mean_dt, std_dt, min_dt, max_dt, _sum_dt = stats_1d_pop(dt)
+
+    pps_8 = 8.0 / (span + eps)
+    bps_8 = sum_size / (span + eps)
+
+    feats: List[float] = []
+    feats.extend([float(x) for x in s])   # 8
+    feats.extend([float(x) for x in dt])  # 7
+
+    feats.extend([mean_size, std_size, min_size, max_size, sum_size])  # 5
+    feats.extend([mean_dt, std_dt, min_dt, max_dt, span])              # 5
+    feats.extend([pps_8, bps_8])                                       # 2
+
+    if len(feats) != 27:
+        raise RuntimeError(f"Internal error: expected 27 features, got {len(feats)}")
     return np.array(feats, dtype=np.float32)
+
 
 def load_model(model_path: str):
     return joblib.load(model_path)
 
+
 def main():
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <pcap_file> <model_path_or_dummy> [max_flows] [max_pkts_per_flow]")
+        print(f"Usage: {sys.argv[0]} <pcap_file> <model.joblib> [max_flows] [topk]")
         sys.exit(1)
 
     pcap_path = sys.argv[1]
     model_path = sys.argv[2]
     max_flows = int(sys.argv[3]) if len(sys.argv) > 3 else 0
-    max_pkts_per_flow = int(sys.argv[4]) if len(sys.argv) > 4 else 200
+    topk = int(sys.argv[4]) if len(sys.argv) > 4 else 50
 
     model = load_model(model_path)
 
@@ -97,7 +138,8 @@ def main():
                     continue
                 ip = eth.data
                 proto = ip.p
-                # Only TCP/UDP in this example
+
+                # Only TCP/UDP
                 if proto not in (dpkt.ip.IP_PROTO_TCP, dpkt.ip.IP_PROTO_UDP):
                     continue
 
@@ -106,56 +148,77 @@ def main():
 
                 if proto == dpkt.ip.IP_PROTO_TCP:
                     tcp = ip.data
-                    sport, dport = tcp.sport, tcp.dport
+                    sport, dport = int(tcp.sport), int(tcp.dport)
                 else:
                     udp = ip.data
-                    sport, dport = udp.sport, udp.dport
+                    sport, dport = int(udp.sport), int(udp.dport)
 
-                key, is_fwd = canonicalize_flow(src_ip, dst_ip, sport, dport, proto)
+                key = canonicalize_flow(src_ip, dst_ip, sport, dport, int(proto))
 
                 st = flows.get(key)
                 if st is None:
                     if max_flows and len(flows) >= max_flows:
+                        # ignore NEW flows after cap
                         continue
                     st = FlowState(t_first=ts, t_last=ts)
                     flows[key] = st
 
                 st.t_last = ts
-                plen = len(ip)  # bytes at IP layer; change if you used wire length
 
-                if is_fwd:
-                    st.pkts_fwd += 1
-                    st.bytes_fwd += plen
-                    st.pkt_lens_fwd.append(plen)
-                    if st.last_ts_fwd is not None:
-                        st.ipt_fwd.append(ts - st.last_ts_fwd)
-                    st.last_ts_fwd = ts
-                else:
-                    st.pkts_rev += 1
-                    st.bytes_rev += plen
-                    st.pkt_lens_rev.append(plen)
-                    if st.last_ts_rev is not None:
-                        st.ipt_rev.append(ts - st.last_ts_rev)
-                    st.last_ts_rev = ts
+                # Match C: ip_len = ntohs(ip->ip_len)
+                # dpkt sets ip.len from header (already host order int)
+                ip_len = int(ip.len) if int(ip.len) > 0 else int(len(ip))
 
-                # optional cap
-                if (st.pkts_fwd + st.pkts_rev) >= max_pkts_per_flow:
-                    pass
+                st.pkts += 1
+                st.bytes += ip_len
+
+                # Collect only first 8 packets in arrival order
+                if len(st.first_ts) < 8:
+                    st.first_ts.append(float(ts))
+                    st.first_size.append(float(abs(ip_len)))
 
             except Exception:
                 continue
 
-    # Build feature matrix
-    keys = list(flows.keys())
-    X = np.stack([extract_features(flows[k]) for k in keys], axis=0)
+    # Build feature matrix for flows with >= 8 packets
+    row_keys: List[FlowKey] = []
+    rows: List[np.ndarray] = []
 
-    # Predict
+    for k, st in flows.items():
+        fv = extract_features_first8_27(st)
+        if fv is None:
+            continue
+        rows.append(fv)
+        row_keys.append(k)
+
+    if not rows:
+        print("No flows with >= 8 packets found; nothing to score.")
+        sys.exit(0)
+
+    X = np.stack(rows, axis=0)
+
+    # Sanity check
+    n_expected = getattr(model, "n_features_in_", None)
+    if n_expected is not None and X.shape[1] != int(n_expected):
+        raise ValueError(f"Feature mismatch: X has {X.shape[1]} features, model expects {n_expected}")
+
+    # Predict probability of positive class
+    if not hasattr(model, "predict_proba"):
+        raise TypeError("Loaded model does not support predict_proba().")
+
     proba = model.predict_proba(X)
-    # print top results
-    for k, p in sorted(zip(keys, proba[:, 1]), key=lambda x: x[1], reverse=True)[:50]:
-        src, dst, sport, dport, proto = k
-        print(f"{src}:{sport} -> {dst}:{dport} proto={proto}  p(class=1)={p:.4f}  "
-              f"pkts={flows[k].pkts_fwd+flows[k].pkts_rev} bytes={flows[k].bytes_fwd+flows[k].bytes_rev}")
+    if proba.ndim != 2 or proba.shape[1] < 2:
+        raise ValueError(f"Unexpected predict_proba shape: {proba.shape}")
+
+    # Print top-k by P(class=1)
+    scored = sorted(zip(row_keys, proba[:, 1]), key=lambda x: x[1], reverse=True)[:topk]
+    for (ip1, ip2, port1, port2, proto), p in scored:
+        st = flows[(ip1, ip2, port1, port2, proto)]
+        print(
+            f"{ip1}:{port1} -> {ip2}:{port2} proto={proto}  "
+            f"p(class=1)={p:.4f}  pkts={st.pkts} bytes={st.bytes}"
+        )
+
 
 if __name__ == "__main__":
     main()
