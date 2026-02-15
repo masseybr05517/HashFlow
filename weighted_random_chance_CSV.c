@@ -406,10 +406,10 @@ static inline void log_collision_event(const struct timeval *tv,
 
 static void write_collisions_csv_from_bin(const char *bin_path, const char *csv_path) {
   FILE *in = fopen(bin_path, "rb");
-  if (!in) { perror("fopen collisions.bin"); return; }
+  if (!in) { perror("fopen weighted_random_chance_collisions.bin"); return; }
 
   FILE *out = fopen(csv_path, "w");
-  if (!out) { perror("fopen collisions.csv"); fclose(in); return; }
+  if (!out) { perror("fopen weighted_random_chance_collisions.csv"); fclose(in); return; }
 
   fprintf(out,
     "ts_us,"
@@ -994,9 +994,9 @@ int main(int argc, char **argv) {
   memset(gt_tab, 0, sizeof(gt_tab));
 
   /* open collision binary log */
-  g_colbin = fopen("collisions.bin", "wb");
+  g_colbin = fopen("weighted_random_chance_collisions.bin", "wb");
   if (!g_colbin) {
-    perror("fopen collisions.bin");
+    perror("fopen weighted_random_chance_collisions.bin");
     return 1;
   }
 
