@@ -89,6 +89,7 @@ static uint32_t fnv1a_32(const char *s) {
 static inline void udp_bloom_clear(void) { memset(udp_bloom, 0, sizeof udp_bloom); }
 static inline void bloom_set_bit(uint32_t bit) { udp_bloom[bit >> 3] |= (uint8_t)(1u << (bit & 7u)); }
 static inline int  bloom_get_bit(uint32_t bit) { return (udp_bloom[bit >> 3] >> (bit & 7u)) & 1u; }
+static uint64_t st_flushed_cap = 0;
 
 static inline uint32_t mix32(uint32_t x) {
   x ^= x >> 16; x *= 0x7feb352du;
@@ -664,7 +665,7 @@ static void dump_and_clear(flow_entry_t *base, flow_entry_t *e, int *tw_head) {
   }
 
   enqueue_flow(e);
-
+  if (e->count >= FLOW_CAP) st_flushed_cap++;
   memset(e, 0, sizeof *e);
   e->tw_slot = e->tw_next = e->tw_prev = -1;
 }
@@ -962,16 +963,18 @@ int main(int argc, char **argv) {
   pcap_close(pc);
 
   fprintf(stderr,
-          "stats: inserted=%" PRIu64 " matched=%" PRIu64
-          " pkts_tracked=%" PRIu64
-          " collisions=%" PRIu64 " battles=%" PRIu64
-          " challenger_wins=%" PRIu64 " incumbent_wins=%" PRIu64
-          " udp_bloom_refused=%" PRIu64 "\n",
-          st_flows_inserted, st_flows_matched,
-          st_packets_tracked,
-          st_collisions, st_battles,
-          st_challenger_wins, st_incumbent_wins,
-          st_udp_bloom_refused);
+        "stats: inserted=%" PRIu64 " matched=%" PRIu64
+        " pkts_tracked=%" PRIu64
+        " collisions=%" PRIu64 " battles=%" PRIu64
+        " challenger_wins=%" PRIu64 " incumbent_wins=%" PRIu64
+        " udp_bloom_refused=%" PRIu64
+        " cap_flushes=%" PRIu64 "\n",
+        st_flows_inserted, st_flows_matched,
+        st_packets_tracked,
+        st_collisions, st_battles,
+        st_challenger_wins, st_incumbent_wins,
+        st_udp_bloom_refused,
+        st_flushed_cap);
 
   fclose(g_colbin);
   g_colbin = NULL;
