@@ -9,6 +9,14 @@
  *
  *  Random policy:
  *    - On collision: evict incumbent with probability 0.5
+ *
+ *  IMPORTANT (as requested):
+ *    - TCP counts as a collision event ONLY for PURE SYN (flags == TH_SYN),
+ *      not SYN+ACK, not any other packet.
+ *    - UDP counts as a collision event ONLY if:
+ *         (a) the UDP challenger flow is not in the table slot (i.e., collision case), AND
+ *         (b) the UDP challenger passes the Bloom admission gate.
+ *      If Bloom refuses the challenger, we DO NOT count/log a collision event.
  *********************************************************************/
 
 #define _DEFAULT_SOURCE
@@ -33,13 +41,13 @@
 #include <zmq.h>
 
 /* ---------- parameters ------------------------------------------- */
-#define TABLE_SIZE (4096) /* must be power of 2 */
-#define FLOW_CAP 40            /* pkts per flow      */
-#define UDP_IDLE_SEC 30        /* idle timeout UDP   */
-#define TW_SLOTS 256           /* must be power of 2 */
-#define BUF_MAX 64             /* ring buffer slots  */
-#define BATCH_SIZE 16          /* flows per JSON msg */
-#define SHOW_OUTPUT 0          /* stderr debug prints */
+#define TABLE_SIZE (4096)       /* must be power of 2 */
+#define FLOW_CAP 40             /* pkts per flow      */
+#define UDP_IDLE_SEC 30         /* idle timeout UDP   */
+#define TW_SLOTS 256            /* must be power of 2 */
+#define BUF_MAX 64              /* ring buffer slots  */
+#define BATCH_SIZE 16           /* flows per JSON msg */
+#define SHOW_OUTPUT 0           /* stderr debug prints */
 #define WRITE_TO_CSV 1
 
 /* ZMQ shutdown / blocking behavior */
@@ -708,7 +716,7 @@ static inline int udp_admission_allowed(const flow_key_t *key) {
 
 static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
                          uint16_t sport, uint16_t dport, uint8_t proto,
-                         int tcp_syn, uint16_t ip_len)
+                         int tcp_pure_syn, uint16_t ip_len)
 {
   tw_advance(tv->tv_sec);
 
@@ -729,30 +737,36 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
   flow_entry_t *m = &base[p];
 
   if (!m->in_use) {
-    if (proto == IPPROTO_TCP && !tcp_syn) return;
+    /* Admission to empty slot */
+    if (proto == IPPROTO_TCP && !tcp_pure_syn) return;
     if (proto == IPPROTO_UDP) { if (!udp_admission_allowed(&key)) return; }
 
     init_new_entry(m, key, sip, dip, sport, dport, proto);
     st_flows_inserted++;
   } else if (!compare_key(&m->key, &key)) {
+    /* Match existing */
     st_flows_matched++;
   } else {
+    /* Collision: ONLY count/log if eligible by your definition */
+
+    if (proto == IPPROTO_TCP) {
+      /* Only PURE SYN can collide */
+      if (!tcp_pure_syn) return;
+    } else {
+      /* UDP: only if challenger passes bloom gate */
+      if (!udp_admission_allowed(&key)) {
+        /* Bloom refused => NOT a collision event by your definition */
+        return;
+      }
+    }
+
+    /* Now it qualifies as a collision event */
     st_collisions++;
     st_battles++;
 
-    if (proto == IPPROTO_TCP && !tcp_syn) return;
-
-    /* RANDOM 50/50 eviction: one RNG draw here */
+    /* RANDOM 50/50 eviction: one RNG draw */
     if (evict_50_50()) {
-      if (proto == IPPROTO_UDP) {
-        if (!udp_admission_allowed(&key)) {
-          st_incumbent_wins++;
-          m->wins++;
-          log_collision_event(tv, &m->key, &key, 1);
-          return;
-        }
-      }
-
+      /* Challenger wins */
       st_challenger_wins++;
       log_collision_event(tv, &key, &m->key, 0);
 
@@ -764,6 +778,7 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
       init_new_entry(m, key, sip, dip, sport, dport, proto);
       st_flows_inserted++;
     } else {
+      /* Incumbent wins */
       st_incumbent_wins++;
       m->wins++;
       log_collision_event(tv, &m->key, &key, 1);
@@ -799,7 +814,7 @@ static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
   uint32_t sip = ip->ip_src.s_addr, dip = ip->ip_dst.s_addr;
 
   uint16_t sport = 0, dport = 0;
-  int syn = 0;
+  int tcp_pure_syn = 0;
 
   int ip_hl = ip->ip_hl * 4;
 
@@ -807,7 +822,10 @@ static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
     const struct tcphdr *th = (const struct tcphdr *)(pkt + sizeof *eth + ip_hl);
     sport = ntohs(th->th_sport);
     dport = ntohs(th->th_dport);
-    syn = (th->th_flags & TH_SYN) != 0;
+
+    /* PURE SYN only: flags must equal TH_SYN (no SYN+ACK, no other flags) */
+    tcp_pure_syn = (th->th_flags == TH_SYN);
+
   } else if (proto == IPPROTO_UDP) {
     const struct udphdr *uh = (const struct udphdr *)(pkt + sizeof *eth + ip_hl);
     sport = ntohs(uh->uh_sport);
@@ -817,7 +835,7 @@ static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
   }
 
   last_pcap_sec = h->ts.tv_sec;
-  track_packet(&h->ts, sip, dip, sport, dport, proto, syn, ntohs(ip->ip_len));
+  track_packet(&h->ts, sip, dip, sport, dport, proto, tcp_pure_syn, ntohs(ip->ip_len));
   return 1;
 }
 

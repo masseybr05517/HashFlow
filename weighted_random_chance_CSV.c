@@ -10,6 +10,12 @@
  *    - On collision:
  *        p(evict)=0.5 while incumbent.count < EVICT_START_COUNT
  *        then linearly decreases from 0.5 at start to 0 at FLOW_CAP
+ *
+ *  IMPORTANT (same updates as Random Chance):
+ *    - TCP collision decisions happen ONLY on PURE SYN (flags == TH_SYN),
+ *      not SYN+ACK, not any other packet.
+ *    - UDP collision decisions happen ONLY if the UDP challenger passes
+ *      Bloom admission. If Bloom refuses, we do NOT count/log a collision.
  *********************************************************************/
 
 #define _DEFAULT_SOURCE
@@ -180,18 +186,18 @@ static inline uint32_t rng32(void) {
 /*                      Weighted eviction function                    */
 /*   One RNG draw per collision decision (same as random version).    */
 /* ================================================================= */
-static inline int evict_prob_50_then_fall(const flow_entry_t *e)
+static inline int evict_prob_50_then_fall(const flow_entry_t *inc)
 {
-  if (e->count >= FLOW_CAP) return 0;
+  if (inc->count >= FLOW_CAP) return 0;
 
   /* Compute p in [0,0.5] */
   double p;
-  if (e->count < EVICT_START_COUNT) {
+  if (inc->count < EVICT_START_COUNT) {
     p = 0.5;
   } else {
     double span = (double)(FLOW_CAP - EVICT_START_COUNT);
     if (span <= 0.0) return 0;
-    double remaining = (double)(FLOW_CAP - e->count);
+    double remaining = (double)(FLOW_CAP - inc->count);
     p = 0.5 * (remaining / span);
     if (p < 0.0) p = 0.0;
     if (p > 0.5) p = 0.5;
@@ -199,7 +205,7 @@ static inline int evict_prob_50_then_fall(const flow_entry_t *e)
 
   /* Convert rng32 to uniform [0,1) without extra RNG calls */
   uint32_t r = rng32();
-  double u = (double)r / 4294967296.0;
+  double u = (double)r / 4294967296.0; /* 2^32 */
   return u < p;
 }
 
@@ -734,12 +740,13 @@ static inline int udp_admission_allowed(const flow_key_t *key) {
 
 static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
                          uint16_t sport, uint16_t dport, uint8_t proto,
-                         int tcp_syn, uint16_t ip_len)
+                         int tcp_pure_syn, uint16_t ip_len)
 {
   tw_advance(tv->tv_sec);
 
   flow_key_t key = make_key(sip, dip, sport, dport, proto);
 
+  /* ground truth counts */
   gt_count_packet(&key);
 
   char kbuf[64];
@@ -754,30 +761,36 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
   flow_entry_t *m = &base[p];
 
   if (!m->in_use) {
-    if (proto == IPPROTO_TCP && !tcp_syn) return;
+    /* Admission to empty slot */
+    if (proto == IPPROTO_TCP && !tcp_pure_syn) return;
     if (proto == IPPROTO_UDP) { if (!udp_admission_allowed(&key)) return; }
 
     init_new_entry(m, key, sip, dip, sport, dport, proto);
     st_flows_inserted++;
   } else if (!compare_key(&m->key, &key)) {
+    /* Match existing */
     st_flows_matched++;
   } else {
+    /* Collision: ONLY count/log if eligible by your definition */
+
+    if (proto == IPPROTO_TCP) {
+      /* Only PURE SYN can collide */
+      if (!tcp_pure_syn) return;
+    } else {
+      /* UDP: only if challenger passes bloom gate */
+      if (!udp_admission_allowed(&key)) {
+        /* Bloom refused => NOT a collision event by your definition */
+        return;
+      }
+    }
+
+    /* Now it qualifies as a collision event */
     st_collisions++;
     st_battles++;
 
-    if (proto == IPPROTO_TCP && !tcp_syn) return;
-
-    /* WEIGHTED eviction: one RNG draw here */
+    /* WEIGHTED eviction: one RNG draw */
     if (evict_prob_50_then_fall(m)) {
-      if (proto == IPPROTO_UDP) {
-        if (!udp_admission_allowed(&key)) {
-          st_incumbent_wins++;
-          m->wins++;
-          log_collision_event(tv, &m->key, &key, 1);
-          return;
-        }
-      }
-
+      /* Challenger wins */
       st_challenger_wins++;
       log_collision_event(tv, &key, &m->key, 0);
 
@@ -789,6 +802,7 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
       init_new_entry(m, key, sip, dip, sport, dport, proto);
       st_flows_inserted++;
     } else {
+      /* Incumbent wins */
       st_incumbent_wins++;
       m->wins++;
       log_collision_event(tv, &m->key, &key, 1);
@@ -824,7 +838,7 @@ static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
   uint32_t sip = ip->ip_src.s_addr, dip = ip->ip_dst.s_addr;
 
   uint16_t sport = 0, dport = 0;
-  int syn = 0;
+  int tcp_pure_syn = 0;
 
   int ip_hl = ip->ip_hl * 4;
 
@@ -832,7 +846,10 @@ static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
     const struct tcphdr *th = (const struct tcphdr *)(pkt + sizeof *eth + ip_hl);
     sport = ntohs(th->th_sport);
     dport = ntohs(th->th_dport);
-    syn = (th->th_flags & TH_SYN) != 0;
+
+    /* PURE SYN only */
+    tcp_pure_syn = (th->th_flags == TH_SYN);
+
   } else if (proto == IPPROTO_UDP) {
     const struct udphdr *uh = (const struct udphdr *)(pkt + sizeof *eth + ip_hl);
     sport = ntohs(uh->uh_sport);
@@ -842,7 +859,7 @@ static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
   }
 
   last_pcap_sec = h->ts.tv_sec;
-  track_packet(&h->ts, sip, dip, sport, dport, proto, syn, ntohs(ip->ip_len));
+  track_packet(&h->ts, sip, dip, sport, dport, proto, tcp_pure_syn, ntohs(ip->ip_len));
   return 1;
 }
 
@@ -964,4 +981,3 @@ int main(int argc, char **argv) {
 
   return 0;
 }
-
