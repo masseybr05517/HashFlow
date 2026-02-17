@@ -1,27 +1,12 @@
 /*********************************************************************
  *  flowhash_zmq_timing_wheel_weighted_random_chance_bloom_seeded.c
  *
- *  Weighted Random Chance (seeded, deterministic) + collision logging
- *  + ground-truth per-flow pkt counts + per-flow collision summary,
- *  WITH eligibility gating for "collision events":
+ *  UPDATE (your request):
+ *   - Different table sizes for TCP vs UDP
+ *     TCP table size = TABLE_SIZE_TCP
+ *     UDP table size = TABLE_SIZE_UDP = TABLE_SIZE_TCP / 4
  *
- *   - TCP counts/logs a collision ONLY if the packet is a *pure SYN*
- *     (flags == TH_SYN; NOT SYN+ACK, not any other packet).
- *   - UDP counts/logs a collision ONLY if the challenger flow is not in
- *     the table slot AND it passes Bloom admission (definitely-not-seen).
- *     If Bloom refuses, we do NOT count/log a collision event.
- *
- *  Weighted policy:
- *   - On eligible collision: evict incumbent with probability:
- *       p=0.5 while incumbent.count < EVICT_START_COUNT
- *       then linearly decreases from 0.5 at start to 0 at FLOW_CAP
- *
- *  Adds flow timing fields in summary:
- *   - first_ts_us, hit30_ts_us, last_ts_us
- *   - dur_to_30_us, dur_30_to_last_us, dur_total_us
- *
- *  Usage:
- *    ./prog file.pcap [seed]
+ *  Everything else kept the same.
  *********************************************************************/
 
 #define _DEFAULT_SOURCE
@@ -46,7 +31,8 @@
 #include <zmq.h>
 
 /* ---------- parameters ------------------------------------------- */
-#define TABLE_SIZE (4096)       /* must be power of 2 */
+#define TABLE_SIZE_TCP (4096)       /* must be power of 2 */
+#define TABLE_SIZE_UDP (TABLE_SIZE_TCP / 4) /* must be power of 2 */
 #define FLOW_CAP 40             /* pkts per flow      */
 #define EVICT_START_COUNT 30    /* 50/50 until 30; then decreases to 0 by 40 */
 #define UDP_IDLE_SEC 30         /* idle timeout UDP   */
@@ -68,8 +54,14 @@
 static uint8_t udp_bloom[UDP_BLOOM_BYTES];
 
 /* compile-time guards */
-#if (TABLE_SIZE & (TABLE_SIZE - 1)) != 0
-#error "TABLE_SIZE must be a power of two"
+#if (TABLE_SIZE_TCP & (TABLE_SIZE_TCP - 1)) != 0
+#error "TABLE_SIZE_TCP must be a power of two"
+#endif
+#if (TABLE_SIZE_UDP & (TABLE_SIZE_UDP - 1)) != 0
+#error "TABLE_SIZE_UDP must be a power of two"
+#endif
+#if (TABLE_SIZE_TCP % 4) != 0
+#error "TABLE_SIZE_TCP must be divisible by 4 so TABLE_SIZE_UDP is an integer"
 #endif
 #if (TW_SLOTS & (TW_SLOTS - 1)) != 0
 #error "TW_SLOTS must be a power of two"
@@ -215,8 +207,8 @@ static inline int evict_prob_50_then_fall(const flow_entry_t *e)
 /* ================================================================= */
 /*                     Tables: split by protocol                      */
 /* ================================================================= */
-static flow_entry_t table_tcp[TABLE_SIZE] = {0};
-static flow_entry_t table_udp[TABLE_SIZE] = {0};
+static flow_entry_t table_tcp[TABLE_SIZE_TCP] = {0};
+static flow_entry_t table_udp[TABLE_SIZE_UDP] = {0};
 
 /* ================================================================= */
 /*                           Timing-wheel (UDP-only)                  */
@@ -809,12 +801,15 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
   char kbuf[64];
   snprintf(kbuf, sizeof kbuf, "%08x%04x%08x%04x%02x",
            key.ip1, key.port1, key.ip2, key.port2, key.proto);
+
   uint32_t h = fnv1a_32(kbuf);
-  uint32_t p = h & (TABLE_SIZE - 1);
 
+  /* UPDATED: protocol-specific mask/index */
   flow_entry_t *base = (proto == IPPROTO_UDP) ? table_udp : table_tcp;
-  int *tw_head = (proto == IPPROTO_UDP) ? tw_head_udp : NULL;
+  uint32_t mask = (proto == IPPROTO_UDP) ? (TABLE_SIZE_UDP - 1u) : (TABLE_SIZE_TCP - 1u);
+  uint32_t p = h & mask;
 
+  int *tw_head = (proto == IPPROTO_UDP) ? tw_head_udp : NULL;
   flow_entry_t *m = &base[p];
 
   if (!m->in_use) {
@@ -945,6 +940,8 @@ int main(int argc, char **argv) {
   if (argc == 3) seed = (uint32_t)strtoul(argv[2], NULL, 10);
   rng_seed(seed);
   fprintf(stderr, "RNG seed=%u\n", seed);
+  fprintf(stderr, "TABLE_SIZE_TCP=%u TABLE_SIZE_UDP=%u\n",
+          (unsigned)TABLE_SIZE_TCP, (unsigned)TABLE_SIZE_UDP);
 
   udp_bloom_clear();
   for (int i = 0; i < TW_SLOTS; ++i) tw_head_udp[i] = -1;
@@ -1001,8 +998,11 @@ int main(int argc, char **argv) {
 
   if (last_pcap_sec != 0) tw_advance(last_pcap_sec + UDP_IDLE_SEC + TW_SLOTS);
 
-  for (int i = 0; i < TABLE_SIZE; ++i) {
+  /* UPDATED: flush each table using its own size */
+  for (uint32_t i = 0; i < TABLE_SIZE_TCP; ++i) {
     if (table_tcp[i].in_use) dump_and_clear(table_tcp, &table_tcp[i], NULL);
+  }
+  for (uint32_t i = 0; i < TABLE_SIZE_UDP; ++i) {
     if (table_udp[i].in_use) dump_and_clear(table_udp, &table_udp[i], tw_head_udp);
   }
 
