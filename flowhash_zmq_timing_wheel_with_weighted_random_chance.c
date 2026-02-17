@@ -1,31 +1,27 @@
 /*********************************************************************
- *  flowhash_zmq_timing_wheel_reservoir_bloom.c
+ *  flowhash_zmq_timing_wheel_weighted_random_chance_bloom_seeded.c
  *
- *  Core behavior:
- *   - Two tables: TCP and UDP (no auxiliary contender table)
- *   - UDP-only timing wheel idle flush
- *   - TCP: only start on SYN; flush at FLOW_CAP
- *   - UDP: flush on idle (timing wheel) or FLOW_CAP
- *   - JSON encode + ZMQ batch push sender thread
- *   - Optional CSV logging split by protocol
+ *  Weighted Random Chance (seeded, deterministic) + collision logging
+ *  + ground-truth per-flow pkt counts + per-flow collision summary,
+ *  WITH eligibility gating for "collision events":
  *
- *  Contention policy (MODIFIED):
- *   - If a packet belongs to a NEW flow that collides with the incumbent in that bucket:
- *       Evict incumbent with probability:
- *         - 50/50 while incumbent.count < EVICT_START_COUNT (30)
- *         - then linearly decreasing from 0.5 at 30 down to 0 at 40
- *       If incumbent stays: wins++ and challenger packet is dropped.
+ *   - TCP counts/logs a collision ONLY if the packet is a *pure SYN*
+ *     (flags == TH_SYN; NOT SYN+ACK, not any other packet).
+ *   - UDP counts/logs a collision ONLY if the challenger flow is not in
+ *     the table slot AND it passes Bloom admission (definitely-not-seen).
+ *     If Bloom refuses, we do NOT count/log a collision event.
  *
- *  UDP-only Bloom filter:
- *   - Used as a UDP admission gate to suppress repeated re-admission of the same UDP flow
- *     (especially after idle expiry).
- *   - Checked ONLY when we would otherwise admit a UDP flow (empty bucket or replacement).
- *   - If "probably seen": refuse admission (drop packet).
- *   - If "definitely not seen": add to bloom and admit.
+ *  Weighted policy:
+ *   - On eligible collision: evict incumbent with probability:
+ *       p=0.5 while incumbent.count < EVICT_START_COUNT
+ *       then linearly decreases from 0.5 at start to 0 at FLOW_CAP
  *
- *  WARNING:
- *   - Bloom filters have false positives. A truly new UDP flow may be refused rarely.
- *   - Make UDP_BLOOM_BITS larger to reduce false positives.
+ *  Adds flow timing fields in summary:
+ *   - first_ts_us, hit30_ts_us, last_ts_us
+ *   - dur_to_30_us, dur_30_to_last_us, dur_total_us
+ *
+ *  Usage:
+ *    ./prog file.pcap [seed]
  *********************************************************************/
 
 #define _DEFAULT_SOURCE
@@ -66,27 +62,21 @@
 #define ZMQ_ENDPOINT "ipc:///tmp/flowpipe"
 
 /* ---------- UDP Bloom filter (UDP-only admission gate) ------------ */
-/* Bits must be power-of-two for fast masking.                        */
-/* 2^28 = 32MB; 2^27 bits = 16MB; 2^26 bits = 8MB; 2^25 bits = 4MB   */
 #define UDP_BLOOM_BITS   (1u << 28)
 #define UDP_BLOOM_BYTES  (UDP_BLOOM_BITS / 8u)
 #define UDP_BLOOM_K 4
-
 static uint8_t udp_bloom[UDP_BLOOM_BYTES];
 
 /* compile-time guards */
 #if (TABLE_SIZE & (TABLE_SIZE - 1)) != 0
 #error "TABLE_SIZE must be a power of two"
 #endif
-
 #if (TW_SLOTS & (TW_SLOTS - 1)) != 0
 #error "TW_SLOTS must be a power of two"
 #endif
-
 #if (UDP_BLOOM_BITS & (UDP_BLOOM_BITS - 1)) != 0
 #error "UDP_BLOOM_BITS must be a power of two"
 #endif
-
 #if (EVICT_START_COUNT < 0) || (EVICT_START_COUNT > FLOW_CAP)
 #error "EVICT_START_COUNT must be within [0, FLOW_CAP]"
 #endif
@@ -102,23 +92,13 @@ static uint32_t fnv1a_32(const char *s) {
 }
 
 /* ---------- bloom helpers ----------------------------------------- */
-static inline void udp_bloom_clear(void) {
-  memset(udp_bloom, 0, sizeof udp_bloom);
-}
-
-static inline void bloom_set_bit(uint32_t bit) {
-  udp_bloom[bit >> 3] |= (uint8_t)(1u << (bit & 7u));
-}
-
-static inline int bloom_get_bit(uint32_t bit) {
-  return (udp_bloom[bit >> 3] >> (bit & 7u)) & 1u;
-}
+static inline void udp_bloom_clear(void) { memset(udp_bloom, 0, sizeof udp_bloom); }
+static inline void bloom_set_bit(uint32_t bit) { udp_bloom[bit >> 3] |= (uint8_t)(1u << (bit & 7u)); }
+static inline int  bloom_get_bit(uint32_t bit) { return (udp_bloom[bit >> 3] >> (bit & 7u)) & 1u; }
 
 static inline uint32_t mix32(uint32_t x) {
-  x ^= x >> 16;
-  x *= 0x7feb352du;
-  x ^= x >> 15;
-  x *= 0x846ca68bu;
+  x ^= x >> 16; x *= 0x7feb352du;
+  x ^= x >> 15; x *= 0x846ca68bu;
   x ^= x >> 16;
   return x;
 }
@@ -141,25 +121,27 @@ typedef struct flow_entry {
   int is_udp;
 
   struct timeval ts[FLOW_CAP];
-  int32_t len[FLOW_CAP];  /* sign encodes direction, magnitude is ip_len */
+  int32_t len[FLOW_CAP];
   int count;
 
-  /* contention: how many collisions incumbent has won */
   uint32_t wins;
 
-  /* --- timing-wheel bookkeeping (UDP-only) --- */
-  int tw_next;
-  int tw_prev;
-  int tw_slot;
+  /* timing-wheel bookkeeping (UDP-only) */
+  int tw_next, tw_prev, tw_slot;
 } flow_entry_t;
 
 static inline int idx_of(flow_entry_t *base, flow_entry_t *e) { return (int)(e - base); }
+
+static inline int compare_key(const flow_key_t *a, const flow_key_t *b) {
+  return !(a->ip1 == b->ip1 && a->ip2 == b->ip2 &&
+           a->port1 == b->port1 && a->port2 == b->port2 &&
+           a->proto == b->proto);
+}
 
 /* Returns 1 if "probably seen", 0 if "definitely not seen".
    If add_if_new=1 and definitely-not-seen, also inserts into bloom. */
 static inline int udp_bloom_probably_seen_and_maybe_add(const flow_key_t *k, int add_if_new)
 {
-  /* hash canonical key fields directly */
   uint32_t h1 = 2166136261u;
   h1 ^= (uint32_t)k->ip1;   h1 *= 16777619u;
   h1 ^= (uint32_t)k->ip2;   h1 *= 16777619u;
@@ -181,14 +163,57 @@ static inline int udp_bloom_probably_seen_and_maybe_add(const flow_key_t *k, int
           bloom_set_bit(b2);
         }
       }
-      return 0; /* definitely not seen */
+      return 0;
     }
   }
-  return 1; /* probably seen */
+  return 1;
 }
 
 /* ================================================================= */
-/*                     Tables: split by protocol                       */
+/*                 Deterministic RNG (xorshift32)                     */
+/* ================================================================= */
+static uint32_t g_rng_state = 1u;
+
+static inline void rng_seed(uint32_t seed) {
+  if (seed == 0) seed = 1u;
+  g_rng_state = seed;
+}
+
+static inline uint32_t rng32(void) {
+  uint32_t x = g_rng_state;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  g_rng_state = x;
+  return x;
+}
+
+/* ================================================================= */
+/*                      Weighted eviction function                    */
+/* ================================================================= */
+static inline int evict_prob_50_then_fall(const flow_entry_t *e)
+{
+  if (e->count >= FLOW_CAP) return 0;
+
+  double p;
+  if (e->count < EVICT_START_COUNT) {
+    p = 0.5;
+  } else {
+    double span = (double)(FLOW_CAP - EVICT_START_COUNT);
+    if (span <= 0.0) return 0;
+    double remaining = (double)(FLOW_CAP - e->count);
+    p = 0.5 * (remaining / span);
+    if (p < 0.0) p = 0.0;
+    if (p > 0.5) p = 0.5;
+  }
+
+  uint32_t r = rng32();
+  double u = (double)r / 4294967296.0;
+  return u < p;
+}
+
+/* ================================================================= */
+/*                     Tables: split by protocol                      */
 /* ================================================================= */
 static flow_entry_t table_tcp[TABLE_SIZE] = {0};
 static flow_entry_t table_udp[TABLE_SIZE] = {0};
@@ -197,7 +222,6 @@ static flow_entry_t table_udp[TABLE_SIZE] = {0};
 /*                           Timing-wheel (UDP-only)                  */
 /* ================================================================= */
 static int tw_head_udp[TW_SLOTS];
-
 static time_t tw_now_sec = 0;
 static int tw_now_slot = 0;
 static int tw_initialised = 0;
@@ -212,17 +236,259 @@ static uint64_t st_flows_inserted = 0;
 static uint64_t st_flows_matched  = 0;
 static uint64_t st_packets_tracked = 0;
 
-static uint64_t st_collisions = 0;
-static uint64_t st_battles = 0;
+static uint64_t st_collisions = 0;      /* eligible collision events */
+static uint64_t st_battles = 0;         /* same as collisions here */
 static uint64_t st_challenger_wins = 0;
 static uint64_t st_incumbent_wins  = 0;
 
 static uint64_t st_udp_bloom_refused = 0;
+static uint64_t st_cap_flushes = 0;
 
-/* ---------- ZMQ batching ring buffer ------------------------------ */
+/* ================================================================= */
+/*    Ground-truth per-flow packet counts + per-flow collision stats  */
+/*    + timing: first_ts_us, hit30_ts_us, last_ts_us                  */
+/* ================================================================= */
+#define GT_SIZE (1u << 22)
+
 typedef struct {
-  flow_entry_t slot;
-} buf_item_t;
+  int in_use;
+  flow_key_t key;
+  uint32_t pkt_count;
+  uint32_t collisions;
+  uint32_t wins;
+  uint32_t losses;
+
+  uint64_t first_ts_us;   /* ts of first packet seen */
+  uint64_t hit30_ts_us;   /* ts when pkt_count becomes 30 (0 if never) */
+  uint64_t last_ts_us;    /* ts of most recent packet seen */
+} gt_entry_t;
+
+static gt_entry_t gt_tab[GT_SIZE];
+
+#if (GT_SIZE & (GT_SIZE - 1)) != 0
+#error "GT_SIZE must be a power of two"
+#endif
+
+static inline uint64_t tv_to_us(const struct timeval *tv) {
+  return (uint64_t)tv->tv_sec * 1000000ull + (uint64_t)tv->tv_usec;
+}
+
+static inline uint32_t hash_flow_key32(const flow_key_t *k) {
+  uint32_t h = 2166136261u;
+  h ^= (uint32_t)k->ip1;   h *= 16777619u;
+  h ^= (uint32_t)k->ip2;   h *= 16777619u;
+  h ^= (uint32_t)k->port1; h *= 16777619u;
+  h ^= (uint32_t)k->port2; h *= 16777619u;
+  h ^= (uint32_t)k->proto; h *= 16777619u;
+  return h;
+}
+
+static gt_entry_t *gt_get_or_insert(const flow_key_t *k) {
+  uint32_t mask = (uint32_t)(GT_SIZE - 1u);
+  uint32_t i = hash_flow_key32(k) & mask;
+
+  for (uint32_t step = 0; step < GT_SIZE; step++) {
+    gt_entry_t *e = &gt_tab[i];
+    if (!e->in_use) {
+      e->in_use = 1;
+      e->key = *k;
+      e->pkt_count = 0;
+      e->collisions = 0;
+      e->wins = 0;
+      e->losses = 0;
+      e->first_ts_us = 0;
+      e->hit30_ts_us = 0;
+      e->last_ts_us = 0;
+      return e;
+    }
+    if (!compare_key(&e->key, k)) return e;
+    i = (i + 1u) & mask;
+  }
+  return NULL;
+}
+
+/* Ground-truth per-packet update (counts ALL packets regardless of gating). */
+static inline void gt_count_packet_tv(const flow_key_t *k, const struct timeval *tv) {
+  gt_entry_t *e = gt_get_or_insert(k);
+  if (!e) return;
+
+  uint64_t t = tv_to_us(tv);
+
+  if (e->first_ts_us == 0) e->first_ts_us = t;
+
+  e->pkt_count++;
+
+  if (e->pkt_count == 30 && e->hit30_ts_us == 0) e->hit30_ts_us = t;
+
+  e->last_ts_us = t;
+}
+
+static inline uint32_t gt_get_pkt_count(const flow_key_t *k) {
+  uint32_t mask = (uint32_t)(GT_SIZE - 1u);
+  uint32_t i = hash_flow_key32(k) & mask;
+
+  for (uint32_t step = 0; step < GT_SIZE; step++) {
+    gt_entry_t *e = &gt_tab[i];
+    if (!e->in_use) return 0;
+    if (!compare_key(&e->key, k)) return e->pkt_count;
+    i = (i + 1u) & mask;
+  }
+  return 0;
+}
+
+static inline void gt_note_collision(const flow_key_t *winner, const flow_key_t *loser) {
+  gt_entry_t *w = gt_get_or_insert(winner);
+  gt_entry_t *l = gt_get_or_insert(loser);
+  if (w) { w->collisions++; w->wins++; }
+  if (l) { l->collisions++; l->losses++; }
+}
+
+/* ================================================================= */
+/*                         Collision event logging                    */
+/* ================================================================= */
+typedef struct {
+  flow_key_t winner;
+  flow_key_t loser;
+  uint8_t winner_was_incumbent;
+  uint64_t ts_us;
+} collision_rec_t;
+
+static FILE *g_colbin = NULL;
+
+static inline void ip_to_str(uint32_t ip, char out[INET_ADDRSTRLEN]) {
+  inet_ntop(AF_INET, &ip, out, INET_ADDRSTRLEN);
+}
+
+static inline void log_collision_event(const struct timeval *tv,
+                                       const flow_key_t *winner,
+                                       const flow_key_t *loser,
+                                       int winner_was_incumbent)
+{
+  if (!g_colbin) return;
+
+  collision_rec_t r;
+  r.winner = *winner;
+  r.loser  = *loser;
+  r.winner_was_incumbent = (uint8_t)(winner_was_incumbent ? 1 : 0);
+  r.ts_us = tv_to_us(tv);
+
+  (void)fwrite(&r, sizeof(r), 1, g_colbin);
+  gt_note_collision(winner, loser);
+}
+
+static void write_collisions_csv_from_bin(const char *bin_path, const char *csv_path) {
+  FILE *in = fopen(bin_path, "rb");
+  if (!in) { perror("fopen weighted_random_chance_collisions.bin"); return; }
+
+  FILE *out = fopen(csv_path, "w");
+  if (!out) { perror("fopen weighted_random_chance_collisions.csv"); fclose(in); return; }
+
+  fprintf(out,
+    "ts_us,"
+    "winner_ip1,winner_port1,winner_ip2,winner_port2,winner_proto,"
+    "loser_ip1,loser_port1,loser_ip2,loser_port2,loser_proto,"
+    "winner_was_incumbent,"
+    "winner_pkts,loser_pkts,"
+    "winner_ge40,loser_ge40\n"
+  );
+
+  collision_rec_t r;
+  while (fread(&r, sizeof(r), 1, in) == 1) {
+    char wip1[INET_ADDRSTRLEN], wip2[INET_ADDRSTRLEN];
+    char lip1[INET_ADDRSTRLEN], lip2[INET_ADDRSTRLEN];
+    ip_to_str(r.winner.ip1, wip1);
+    ip_to_str(r.winner.ip2, wip2);
+    ip_to_str(r.loser.ip1,  lip1);
+    ip_to_str(r.loser.ip2,  lip2);
+
+    uint32_t wp = gt_get_pkt_count(&r.winner);
+    uint32_t lp = gt_get_pkt_count(&r.loser);
+
+    int w_ge = (wp >= FLOW_CAP);
+    int l_ge = (lp >= FLOW_CAP);
+
+    fprintf(out,
+      "%" PRIu64 ","
+      "%s,%u,%s,%u,%s,"
+      "%s,%u,%s,%u,%s,"
+      "%u,"
+      "%u,%u,"
+      "%d,%d\n",
+      r.ts_us,
+      wip1, (unsigned)r.winner.port1, wip2, (unsigned)r.winner.port2, (r.winner.proto == IPPROTO_UDP ? "UDP" : "TCP"),
+      lip1, (unsigned)r.loser.port1,  lip2, (unsigned)r.loser.port2,  (r.loser.proto  == IPPROTO_UDP ? "UDP" : "TCP"),
+      (unsigned)r.winner_was_incumbent,
+      (unsigned)wp, (unsigned)lp,
+      w_ge, l_ge
+    );
+  }
+
+  fclose(out);
+  fclose(in);
+}
+
+/* UPDATED summary writer: includes dur_30_to_last_us */
+static void write_flow_collision_summary_csv(const char *csv_path) {
+  FILE *out = fopen(csv_path, "w");
+  if (!out) { perror("fopen weighted_random_chance_flow_collision_summary.csv"); return; }
+
+  fprintf(out,
+          "ip1,port1,ip2,port2,proto,"
+          "pkts,ge40,collisions,wins,losses,"
+          "first_ts_us,hit30_ts_us,last_ts_us,"
+          "dur_to_30_us,dur_30_to_last_us,dur_total_us\n");
+
+  for (uint32_t i = 0; i < GT_SIZE; i++) {
+    gt_entry_t *e = &gt_tab[i];
+    if (!e->in_use) continue;
+
+    char ip1[INET_ADDRSTRLEN], ip2[INET_ADDRSTRLEN];
+    ip_to_str(e->key.ip1, ip1);
+    ip_to_str(e->key.ip2, ip2);
+
+    uint64_t dur_to_30 = 0;
+    if (e->hit30_ts_us != 0 && e->first_ts_us != 0 && e->hit30_ts_us >= e->first_ts_us) {
+      dur_to_30 = e->hit30_ts_us - e->first_ts_us;
+    }
+
+    uint64_t dur_30_to_last = 0;
+    if (e->hit30_ts_us != 0 && e->last_ts_us != 0 && e->last_ts_us >= e->hit30_ts_us) {
+      dur_30_to_last = e->last_ts_us - e->hit30_ts_us;
+    }
+
+    uint64_t dur_total = 0;
+    if (e->last_ts_us != 0 && e->first_ts_us != 0 && e->last_ts_us >= e->first_ts_us) {
+      dur_total = e->last_ts_us - e->first_ts_us;
+    }
+
+    fprintf(out,
+      "%s,%u,%s,%u,%s,"
+      "%u,%d,%u,%u,%u,"
+      "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+      "%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+      ip1, (unsigned)e->key.port1,
+      ip2, (unsigned)e->key.port2,
+      (e->key.proto == IPPROTO_UDP ? "UDP" : "TCP"),
+      (unsigned)e->pkt_count,
+      (e->pkt_count >= FLOW_CAP) ? 1 : 0,
+      (unsigned)e->collisions,
+      (unsigned)e->wins,
+      (unsigned)e->losses,
+      e->first_ts_us,
+      e->hit30_ts_us,
+      e->last_ts_us,
+      dur_to_30,
+      dur_30_to_last,
+      dur_total
+    );
+  }
+
+  fclose(out);
+}
+
+/* ================================================================= */
+/* ---------- ZMQ batching ring buffer ------------------------------ */
+typedef struct { flow_entry_t slot; } buf_item_t;
 
 static buf_item_t flow_buf[BUF_MAX];
 static size_t head = 0, tail = 0, fill = 0;
@@ -232,51 +498,9 @@ static pthread_t zmq_thread;
 static int exiting = 0;
 
 /* ================================================================= */
-/*                         RNG + eviction policy                      */
-/* ================================================================= */
-static uint32_t g_rng_state = 0x12345678u;
-
-static inline uint32_t rng32(void) {
-  /* xorshift32 */
-  uint32_t x = g_rng_state;
-  x ^= x << 13;
-  x ^= x >> 17;
-  x ^= x << 5;
-  g_rng_state = x;
-  return x;
-}
-
-/* Returns 1 to evict incumbent, 0 to keep incumbent */
-static inline int evict_prob_50_then_fall(const flow_entry_t *e)
-{
-  /* Completed flows are never evicted */
-  if (e->count >= FLOW_CAP)
-    return 0;
-
-  /* 50/50 up to EVICT_START_COUNT */
-  if (e->count < EVICT_START_COUNT)
-    return (rng32() & 1u);
-
-  /* After EVICT_START_COUNT, decrease from 0.5 at EVICT_START_COUNT to 0 at FLOW_CAP:
-     p = 0.5 * (FLOW_CAP - count) / (FLOW_CAP - EVICT_START_COUNT) */
-  uint32_t span = (uint32_t)(FLOW_CAP - EVICT_START_COUNT);
-  if (span == 0) return 0; /* safety */
-
-  uint32_t remaining = (uint32_t)(FLOW_CAP - e->count); /* span..1 when count=start..cap-1 */
-
-  /* thresh = p * 2^32 = (remaining / (2*span)) * 2^32 */
-  uint32_t thresh = (uint32_t)(((uint64_t)remaining << 32) / (2u * span));
-
-  return rng32() < thresh;
-}
-
-/* ================================================================= */
 /*                           Timing-wheel helpers                     */
-/* ================================================================= */
 static void tw_init(time_t start_sec) {
-  for (int i = 0; i < TW_SLOTS; ++i) {
-    tw_head_udp[i] = -1;
-  }
+  for (int i = 0; i < TW_SLOTS; ++i) tw_head_udp[i] = -1;
   tw_now_sec = start_sec;
   tw_now_slot = (int)(start_sec % TW_SLOTS);
   tw_initialised = 1;
@@ -289,13 +513,10 @@ static void tw_remove_generic(flow_entry_t *base, int *tw_head, int idx)
 
   int slot = e->tw_slot;
 
-  if (e->tw_prev != -1)
-    base[e->tw_prev].tw_next = e->tw_next;
-  else
-    tw_head[slot] = e->tw_next;
+  if (e->tw_prev != -1) base[e->tw_prev].tw_next = e->tw_next;
+  else                  tw_head[slot] = e->tw_next;
 
-  if (e->tw_next != -1)
-    base[e->tw_next].tw_prev = e->tw_prev;
+  if (e->tw_next != -1) base[e->tw_next].tw_prev = e->tw_prev;
 
   e->tw_slot = -1;
   e->tw_next = -1;
@@ -306,8 +527,7 @@ static void tw_insert_generic(flow_entry_t *base, int *tw_head, int idx, time_t 
 {
   flow_entry_t *e = &base[idx];
 
-  if (e->tw_slot >= 0)
-    tw_remove_generic(base, tw_head, idx);
+  if (e->tw_slot >= 0) tw_remove_generic(base, tw_head, idx);
 
   int slot = (int)(exp_sec % TW_SLOTS);
 
@@ -315,15 +535,12 @@ static void tw_insert_generic(flow_entry_t *base, int *tw_head, int idx, time_t 
   e->tw_prev = -1;
   e->tw_next = tw_head[slot];
 
-  if (tw_head[slot] != -1)
-    base[tw_head[slot]].tw_prev = idx;
-
+  if (tw_head[slot] != -1) base[tw_head[slot]].tw_prev = idx;
   tw_head[slot] = idx;
 }
 
 /* ================================================================= */
 /*                       JSON encoding helpers                        */
-/* ================================================================= */
 static json_t *json_from_entry(const flow_entry_t *f) {
   if (f->count <= 0) return json_object();
 
@@ -354,7 +571,6 @@ static json_t *json_from_entry(const flow_entry_t *f) {
 
 /* ================================================================= */
 /*                    Buffer / sender-thread logic                    */
-/* ================================================================= */
 static inline void enqueue_flow(const flow_entry_t *src) {
   pthread_mutex_lock(&mtx);
   if (fill == BUF_MAX) {
@@ -364,7 +580,6 @@ static inline void enqueue_flow(const flow_entry_t *src) {
   flow_buf[head].slot = *src;
   head = (head + 1) % BUF_MAX;
   fill++;
-
   pthread_cond_signal(&cond_full);
   pthread_mutex_unlock(&mtx);
 }
@@ -390,14 +605,9 @@ static void *sender_thread(void *arg) {
 
   for (;;) {
     pthread_mutex_lock(&mtx);
-    while (fill == 0 && !exiting) {
-      pthread_cond_wait(&cond_full, &mtx);
-    }
+    while (fill == 0 && !exiting) pthread_cond_wait(&cond_full, &mtx);
 
-    if (exiting && fill == 0) {
-      pthread_mutex_unlock(&mtx);
-      break;
-    }
+    if (exiting && fill == 0) { pthread_mutex_unlock(&mtx); break; }
 
     json_t *batch = json_array();
     int sent = 0;
@@ -407,11 +617,9 @@ static void *sender_thread(void *arg) {
       tail = (tail + 1) % BUF_MAX;
       fill--;
       sent++;
-
       json_t *obj = json_from_entry(&item.slot);
       json_array_append_new(batch, obj);
     }
-
     pthread_mutex_unlock(&mtx);
 
     if (json_array_size(batch) > 0) {
@@ -429,22 +637,13 @@ static void *sender_thread(void *arg) {
 
 /* ================================================================= */
 /*                         helper functions                           */
-/* ================================================================= */
-static int compare_key(const flow_key_t *a, const flow_key_t *b) {
-  return !(a->ip1 == b->ip1 && a->ip2 == b->ip2 &&
-           a->port1 == b->port1 && a->port2 == b->port2 &&
-           a->proto == b->proto);
-}
-
 static flow_key_t make_key(uint32_t s_ip, uint32_t d_ip, uint16_t s_pt,
                            uint16_t d_pt, uint8_t proto) {
   flow_key_t k;
   if (ntohl(s_ip) < ntohl(d_ip)) {
-    k.ip1 = s_ip; k.ip2 = d_ip;
-    k.port1 = s_pt; k.port2 = d_pt;
+    k.ip1 = s_ip; k.ip2 = d_ip; k.port1 = s_pt; k.port2 = d_pt;
   } else if (ntohl(s_ip) > ntohl(d_ip)) {
-    k.ip1 = d_ip; k.ip2 = s_ip;
-    k.port1 = d_pt; k.port2 = s_pt;
+    k.ip1 = d_ip; k.ip2 = s_ip; k.port1 = d_pt; k.port2 = s_pt;
   } else {
     k.ip1 = s_ip; k.ip2 = d_ip;
     if (s_pt > d_pt) { uint16_t t = s_pt; s_pt = d_pt; d_pt = t; }
@@ -456,7 +655,6 @@ static flow_key_t make_key(uint32_t s_ip, uint32_t d_ip, uint16_t s_pt,
 
 /* ================================================================= */
 /*                         CSV logging                                */
-/* ================================================================= */
 static void write_to_csv(flow_entry_t *e) {
   if (e->count != FLOW_CAP) return;
 
@@ -502,8 +700,9 @@ static void write_to_csv(flow_entry_t *e) {
 
 /* ================================================================= */
 /*                     flow finalisation & output                     */
-/* ================================================================= */
 static void dump_and_clear(flow_entry_t *base, flow_entry_t *e, int *tw_head) {
+  if (e->count >= FLOW_CAP) st_cap_flushes++;
+
   if (e->is_udp && base == table_udp) {
     int idx = idx_of(base, e);
     tw_remove_generic(base, tw_head, idx);
@@ -528,7 +727,6 @@ static void dump_and_clear(flow_entry_t *base, flow_entry_t *e, int *tw_head) {
 
 /* ================================================================= */
 /*                 timing-wheel advance logic (UDP-only expiry)        */
-/* ================================================================= */
 static void expire_slot_list_udp(int slot) {
   int idx = tw_head_udp[slot];
   tw_head_udp[slot] = -1;
@@ -547,14 +745,10 @@ static void tw_advance(time_t now_sec) {
 
   if (!tw_initialised) tw_init(now_sec);
 
-  if (now_sec <= tw_now_sec) {
-    g_in_tw = 0;
-    return;
-  }
+  if (now_sec <= tw_now_sec) { g_in_tw = 0; return; }
 
   time_t delta = now_sec - tw_now_sec;
 
-  /* BIG JUMP: expire everything UDP */
   if (delta >= TW_SLOTS) {
     for (int s = 0; s < TW_SLOTS; ++s) expire_slot_list_udp(s);
     tw_now_sec  = now_sec;
@@ -563,7 +757,6 @@ static void tw_advance(time_t now_sec) {
     return;
   }
 
-  /* step */
   while (tw_now_sec < now_sec) {
     tw_now_sec++;
     tw_now_slot = (tw_now_slot + 1) & (TW_SLOTS - 1);
@@ -575,7 +768,6 @@ static void tw_advance(time_t now_sec) {
 
 /* ================================================================= */
 /*                 packet tracking (called per packet)               */
-/* ================================================================= */
 static void init_new_entry(flow_entry_t *e, flow_key_t key,
                            uint32_t sip, uint32_t dip,
                            uint16_t sport, uint16_t dport,
@@ -595,24 +787,24 @@ static void init_new_entry(flow_entry_t *e, flow_key_t key,
   e->tw_slot = e->tw_next = e->tw_prev = -1;
 }
 
-/* Decide if we can admit a UDP flow (Bloom gate). Returns 1 if allowed, 0 if refused. */
+/* Decide if we can admit a UDP flow (Bloom gate).
+   Returns 1 if allowed (definitely-not-seen => inserted), 0 if refused. */
 static inline int udp_admission_allowed(const flow_key_t *key) {
-  int seen = udp_bloom_probably_seen_and_maybe_add(key, /*add_if_new=*/1);
-  if (seen) {
-    st_udp_bloom_refused++;
-    return 0;
-  }
+  int seen = udp_bloom_probably_seen_and_maybe_add(key, 1);
+  if (seen) { st_udp_bloom_refused++; return 0; }
   return 1;
 }
 
 static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
                          uint16_t sport, uint16_t dport, uint8_t proto,
-                         int tcp_syn, uint16_t ip_len)
+                         int tcp_pure_syn, uint16_t ip_len)
 {
-  /* Keep UDP expiry correct */
   tw_advance(tv->tv_sec);
 
   flow_key_t key = make_key(sip, dip, sport, dport, proto);
+
+  /* Ground-truth counts/timestamps: ALWAYS update for all packets */
+  gt_count_packet_tv(&key, tv);
 
   char kbuf[64];
   snprintf(kbuf, sizeof kbuf, "%08x%04x%08x%04x%02x",
@@ -625,56 +817,55 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
 
   flow_entry_t *m = &base[p];
 
-  /* If empty bucket: admit directly (UDP subject to bloom) */
   if (!m->in_use) {
-    if (proto == IPPROTO_TCP && !tcp_syn) return;
-
-    if (proto == IPPROTO_UDP) {
+    /* admission gating for NEW flows */
+    if (proto == IPPROTO_TCP) {
+      if (!tcp_pure_syn) return;
+    } else { /* UDP */
       if (!udp_admission_allowed(&key)) return;
     }
 
     init_new_entry(m, key, sip, dip, sport, dport, proto);
     st_flows_inserted++;
   } else if (!compare_key(&m->key, &key)) {
-    /* match */
     st_flows_matched++;
   } else {
-    /* collision with incumbent */
+    /* Collision opportunity in this slot: apply eligibility gating FIRST */
+    if (proto == IPPROTO_TCP) {
+      if (!tcp_pure_syn) return; /* not pure SYN => NOT a collision event */
+    } else {
+      /* UDP: only a collision event if challenger passes Bloom */
+      if (!udp_admission_allowed(&key)) {
+        /* Bloom refused => challenger dropped, not counted/logged */
+        return;
+      }
+    }
+
+    /* Now this qualifies as a collision event */
     st_collisions++;
     st_battles++;
 
-    if (proto == IPPROTO_TCP && !tcp_syn) return;
-
-    /* NEW POLICY: evict incumbent based on incumbent->count:
-       50/50 until 30 packets, then decreasing toward 0 by 40. */
     if (evict_prob_50_then_fall(m)) {
-      /* Challenger would replace incumbent: apply UDP bloom gate first */
-      if (proto == IPPROTO_UDP) {
-        if (!udp_admission_allowed(&key)) {
-          /* if refused, treat as challenger dropped; incumbent remains */
-          return;
-        }
-      }
-
+      /* Challenger wins */
       st_challenger_wins++;
+      log_collision_event(tv, &key, &m->key, 0);
 
-      /* remove incumbent from wheel if UDP */
       if (proto == IPPROTO_UDP && tw_head != NULL) {
-        int idx = (int)p;
-        tw_remove_generic(base, tw_head, idx);
+        tw_remove_generic(base, tw_head, (int)p);
       }
 
       init_new_entry(m, key, sip, dip, sport, dport, proto);
       st_flows_inserted++;
     } else {
-      /* incumbent stays */
+      /* Incumbent wins */
       st_incumbent_wins++;
       m->wins++;
-      return; /* drop challenger packet */
+      log_collision_event(tv, &m->key, &key, 1);
+      return;
     }
   }
 
-  /* Track packet into selected entry */
+  /* Track packet into the (current) resident entry */
   if (m->count < FLOW_CAP) {
     int from_cli = (sip == m->cli_ip && sport == m->cli_port);
     m->ts[m->count] = *tv;
@@ -683,12 +874,10 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
     st_packets_tracked++;
   }
 
-  /* UDP: reschedule idle expiry */
   if (proto == IPPROTO_UDP && tw_head != NULL) {
     tw_insert_generic(base, tw_head, (int)p, tv->tv_sec + UDP_IDLE_SEC);
   }
 
-  /* Flush on FLOW_CAP */
   if (m->count == FLOW_CAP) {
     dump_and_clear(base, m, tw_head);
   }
@@ -696,7 +885,6 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip,
 
 /* ================================================================= */
 /*                parse Ethernet/IP/TCP/UDP & call tracker            */
-/* ================================================================= */
 static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
   const struct ether_header *eth = (const struct ether_header *)pkt;
   if (ntohs(eth->ether_type) != ETHERTYPE_IP) return 0;
@@ -706,7 +894,7 @@ static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
   uint32_t sip = ip->ip_src.s_addr, dip = ip->ip_dst.s_addr;
 
   uint16_t sport = 0, dport = 0;
-  int syn = 0;
+  int pure_syn = 0;
 
   int ip_hl = ip->ip_hl * 4;
 
@@ -714,7 +902,9 @@ static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
     const struct tcphdr *th = (const struct tcphdr *)(pkt + sizeof *eth + ip_hl);
     sport = ntohs(th->th_sport);
     dport = ntohs(th->th_dport);
-    syn = (th->th_flags & TH_SYN) != 0;
+
+    /* PURE SYN only (no SYN+ACK, no other flags) */
+    pure_syn = (th->th_flags == TH_SYN);
   } else if (proto == IPPROTO_UDP) {
     const struct udphdr *uh = (const struct udphdr *)(pkt + sizeof *eth + ip_hl);
     sport = ntohs(uh->uh_sport);
@@ -724,7 +914,7 @@ static int parse_and_track(const struct pcap_pkthdr *h, const u_char *pkt) {
   }
 
   last_pcap_sec = h->ts.tv_sec;
-  track_packet(&h->ts, sip, dip, sport, dport, proto, syn, ntohs(ip->ip_len));
+  track_packet(&h->ts, sip, dip, sport, dport, proto, pure_syn, ntohs(ip->ip_len));
   return 1;
 }
 
@@ -744,28 +934,31 @@ static void on_sigquit(int sig) {
 
 /* ================================================================= */
 /*                                main                               */
-/* ================================================================= */
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    fprintf(stderr, "usage: %s file.pcap\n", argv[0]);
+  if (argc < 2 || argc > 3) {
+    fprintf(stderr, "usage: %s file.pcap [seed]\n", argv[0]);
     return 1;
   }
-  signal(SIGQUIT, on_sigquit);  /* Ctrl+\ */
+  signal(SIGQUIT, on_sigquit);
 
-  srand((unsigned)time(NULL));
-  /* Seed our fast RNG used by evict_prob_50_then_fall() */
-  g_rng_state = (uint32_t)time(NULL) ^ (uint32_t)getpid() ^ 0x9e3779b9u;
-  if (g_rng_state == 0) g_rng_state = 1u;
+  uint32_t seed = 123456789u;
+  if (argc == 3) seed = (uint32_t)strtoul(argv[2], NULL, 10);
+  rng_seed(seed);
+  fprintf(stderr, "RNG seed=%u\n", seed);
 
-  /* init bloom + wheel */
   udp_bloom_clear();
   for (int i = 0; i < TW_SLOTS; ++i) tw_head_udp[i] = -1;
+  memset(gt_tab, 0, sizeof(gt_tab));
+
+  g_colbin = fopen("weighted_random_chance_collisions.bin", "wb");
+  if (!g_colbin) { perror("fopen weighted_random_chance_collisions.bin"); return 1; }
 
   char err[PCAP_ERRBUF_SIZE];
   fprintf(stderr, "main: starting\n");
   pcap_t *pc = pcap_open_offline(argv[1], err);
   if (!pc) {
     fprintf(stderr, "pcap_open: %s\n", err);
+    fclose(g_colbin);
     return 1;
   }
   fprintf(stderr, "main: pcap opened\n");
@@ -773,6 +966,7 @@ int main(int argc, char **argv) {
   if (pthread_create(&zmq_thread, NULL, sender_thread, NULL) != 0) {
     perror("pthread_create");
     pcap_close(pc);
+    fclose(g_colbin);
     return 1;
   }
   fprintf(stderr, "main: sender thread created\n");
@@ -788,8 +982,7 @@ int main(int argc, char **argv) {
     if (rc == 0) {
       zeros++;
       if ((zeros % 100000ULL) == 0) {
-        fprintf(stderr, "pcap_next_ex: rc==0 zeros=%" PRIu64 " iters=%" PRIu64 "\n",
-                zeros, iters);
+        fprintf(stderr, "pcap_next_ex: rc==0 zeros=%" PRIu64 " iters=%" PRIu64 "\n", zeros, iters);
       }
       continue;
     }
@@ -806,12 +999,8 @@ int main(int argc, char **argv) {
   if (rc == -1) fprintf(stderr, "pcap error: %s\n", pcap_geterr(pc));
   fprintf(stderr, "main: pcap loop done rc=%d\n", rc);
 
-  /* final flush: advance far enough to expire all UDP flows */
-  if (last_pcap_sec != 0) {
-    tw_advance(last_pcap_sec + UDP_IDLE_SEC + TW_SLOTS);
-  }
+  if (last_pcap_sec != 0) tw_advance(last_pcap_sec + UDP_IDLE_SEC + TW_SLOTS);
 
-  /* flush both tables */
   for (int i = 0; i < TABLE_SIZE; ++i) {
     if (table_tcp[i].in_use) dump_and_clear(table_tcp, &table_tcp[i], NULL);
     if (table_udp[i].in_use) dump_and_clear(table_udp, &table_udp[i], tw_head_udp);
@@ -832,12 +1021,18 @@ int main(int argc, char **argv) {
           " pkts_tracked=%" PRIu64
           " collisions=%" PRIu64 " battles=%" PRIu64
           " challenger_wins=%" PRIu64 " incumbent_wins=%" PRIu64
-          " udp_bloom_refused=%" PRIu64 "\n",
+          " udp_bloom_refused=%" PRIu64 " cap_flushes=%" PRIu64 "\n",
           st_flows_inserted, st_flows_matched,
           st_packets_tracked,
           st_collisions, st_battles,
           st_challenger_wins, st_incumbent_wins,
-          st_udp_bloom_refused);
+          st_udp_bloom_refused, st_cap_flushes);
+
+  fclose(g_colbin);
+  g_colbin = NULL;
+
+  write_collisions_csv_from_bin("weighted_random_chance_collisions.bin", "weighted_random_chance_collisions.csv");
+  write_flow_collision_summary_csv("weighted_random_chance_flow_collision_summary.csv");
 
   return 0;
 }
