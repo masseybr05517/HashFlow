@@ -343,6 +343,25 @@ def main():
     print("\n=== Files in TEST set ===")
     for f in test_files:
         print(f)
+    import shutil
+
+    dest_dir = "test_split_data"
+    os.makedirs(dest_dir, exist_ok=True)
+
+    for csv_name in test_files:
+        base = os.path.splitext(csv_name)[0]
+
+        # Search for matching PCAP under training_data
+        for root, _, files in os.walk("training_data"):
+            pcap_name = base + ".pcap"
+            if pcap_name in files:
+                src_path = os.path.join(root, pcap_name)
+                shutil.copy2(src_path, dest_dir)
+                print(f"Copied {src_path}")
+                break
+        else:
+            print(f"Missing PCAP for {csv_name}")
+
 
     X_train = X_df.iloc[train_idx].values
     y_train = y[train_idx]
