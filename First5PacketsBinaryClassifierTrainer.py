@@ -251,7 +251,15 @@ def build_dataset(csv_glob: str, first_n: int, target_packets: int) -> Tuple[pd.
       y: labels
       groups: group ids (e.g., file) for splitting
     """
-    paths = sorted(glob.glob(csv_glob, recursive=True))
+    all_paths = sorted(glob.glob(csv_glob, recursive=True))
+
+    paths = [
+        p for p in all_paths
+        if not (
+            p.endswith("labeled.csv") or
+            p.endswith("with_domain_name.csv")
+        )
+    ]
     if not paths:
         raise FileNotFoundError(f"No CSVs matched: {csv_glob}")
 
