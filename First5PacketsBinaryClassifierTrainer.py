@@ -343,55 +343,7 @@ def main():
     print("\n=== Files in TEST set ===")
     for f in test_files:
         print(f)
-    dest_dir = "../test_split_data"
-    src_root = "../training_data"
-
-    os.makedirs(dest_dir, exist_ok=True)
-
-    # 1) Index every PCAP once: { "ow6": "/full/path/to/ow6.pcap", ... }
-    pcap_index = {}
-    for root, _, files in os.walk(src_root):
-        for fn in files:
-            # normalize extension and basename
-            base, ext = os.path.splitext(fn)
-            if ext.lower() == ".pcap":
-                # store first occurrence; warn if duplicates
-                key = base.strip()
-                full = os.path.join(root, fn)
-                if key in pcap_index and pcap_index[key] != full:
-                    print(f"WARNING: duplicate PCAP basename '{key}':")
-                    print(f"  already: {pcap_index[key]}")
-                    print(f"  new    : {full}")
-                else:
-                    pcap_index[key] = full
-
-    print(f"Indexed {len(pcap_index)} PCAPs under '{src_root}'")
-
-    # 2) Copy the PCAPs corresponding to your test CSVs
-    missing = []
-    for csv_name in test_files:
-        csv_name = str(csv_name).strip()              # kills hidden whitespace / \r
-        base = os.path.splitext(csv_name)[0].strip()  # "ow6"
-
-        src_pcap = pcap_index.get(base)
-        if src_pcap and os.path.exists(src_pcap):
-            shutil.copy2(src_pcap, dest_dir)
-            # print(f"Copied {src_pcap}")  # uncomment if you want verbose
-        else:
-            missing.append(csv_name)
-
-    # 3) Debug output for missing ones
-    if missing:
-        print("\n=== Missing PCAPs for these test CSVs ===")
-        for m in missing:
-            b = os.path.splitext(str(m).strip())[0].strip()
-            print(f"- {m!r}  (base={b!r})")
-            # show near-matches if any (helpful for .pcapng / capitalization)
-            near = [k for k in pcap_index.keys() if k.lower() == b.lower()]
-            if near:
-                print(f"  NOTE: found case-insensitive match(es): {near[:5]}")
-    else:
-        print("\nAll test PCAPs copied successfully.")
+    
 
     X_train = X_df.iloc[train_idx].values
     y_train = y[train_idx]
