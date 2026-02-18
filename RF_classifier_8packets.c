@@ -1,30 +1,31 @@
 /*********************************************************************
  *  flowhash_zmq_timing_wheel_with_prediction_two_tables_bloom.c
  *
- *  MODIFIED (Feb 2026, per your request):
- *   - Removes TL2cgen dependency (no header.h, no predict()/postprocess()).
- *   - Uses an embedded Python bridge to load a sklearn/joblib binary classifier
- *     once, and call predict_proba(x)[1] for gating decisions.
+ *  MODIFIED (Feb 2026):
+ *   - Uses embedded Python + joblib sklearn model for keep/evict decisions
+ *     (predict_proba for class=1).
+ *
+ *  UPDATED (per your request):
+ *   - Adds CSV outputs like your weighted_random_chance_bloom_seeded.c:
+ *       1) Per-flow feature-vector dump at FLOW_CAP (already present)
+ *       2) collision events logged to a .bin during runtime, then converted to:
+ *            joblib_two_tables_collisions.csv
+ *       3) ground-truth per-flow summary CSV:
+ *            joblib_two_tables_flow_collision_summary.csv
  *
  *  NEW usage:
  *     ./flowhash_with_joblib file.pcap model.joblib
+ *
+ *  Expected Python module in working dir (or PYTHONPATH):
+ *     joblib_predict.py with:
+ *       init(model_path: str, expected_n: int=27) -> True
+ *       predict_proba_1(x_list: list[float]) -> float   # p(class=1)
  *
  *  Build (example):
  *     gcc -O2 -Wall -Wextra -pthread \
  *       flowhash_zmq_timing_wheel_with_prediction_two_tables_bloom.c \
  *       $(python3-config --cflags) $(python3-config --ldflags) \
  *       -lpcap -lzmq -ljansson -lm -o flowhash_with_joblib
- *
- *  NOTE:
- *   - This assumes your model supports predict_proba (RF, LR, Pipeline, etc.).
- *   - The python module "joblib_predict.py" must be importable (same directory
- *     as the binary or on PYTHONPATH). See below for the expected module API.
- *
- *  Expected Python module (joblib_predict.py):
- *     init(model_path: str, expected_n: int=27) -> True
- *     predict_proba_1(x_list: list[float]) -> float  # p(class=1)
- *
- *  (Everything else in your program is preserved.)
  *********************************************************************/
 
 #define _DEFAULT_SOURCE
@@ -95,10 +96,10 @@ static uint8_t udp_bloom[UDP_BLOOM_BYTES];
 #error "UDP_BLOOM_BITS must be a power of two"
 #endif
 #if (UDP_AUX_SIZE & (UDP_AUX_SIZE - 1)) != 0
-#error "UDP_AUX_SIZE must be a power of two (TABLE_SIZE/4 is OK if TABLE_SIZE is power of two)"
+#error "UDP_AUX_SIZE must be a power of two"
 #endif
 #if (TCP_AUX_SIZE & (TCP_AUX_SIZE - 1)) != 0
-#error "TCP_AUX_SIZE must be a power of two (TABLE_SIZE/4 is OK if TABLE_SIZE is power of two)"
+#error "TCP_AUX_SIZE must be a power of two"
 #endif
 
 /* ================================================================= */
@@ -106,7 +107,7 @@ static uint8_t udp_bloom[UDP_BLOOM_BYTES];
 /* ================================================================= */
 
 /*
- * We import a python module named "joblib_predict" with functions:
+ * We import python module "joblib_predict" with:
  *   init(model_path: str, expected_n: int=27) -> True
  *   predict_proba_1(x_list: list[float]) -> float  # p(class=1)
  */
@@ -349,6 +350,12 @@ static uint64_t st_aux_wins = 0;
 
 static uint64_t st_udp_bloom_refused = 0;
 
+/* collision-style stats (like your other code) */
+static uint64_t st_collisions = 0;      /* eligible duel/collision events (both sides have FIRST_N) */
+static uint64_t st_battles = 0;         /* same as collisions here */
+static uint64_t st_challenger_wins = 0; /* aux wins */
+static uint64_t st_incumbent_wins = 0;  /* main wins */
+
 static volatile sig_atomic_t g_sigquit_dump_full = 0;
 static volatile sig_atomic_t g_in_tw = 0;
 static volatile sig_atomic_t g_tw_now_arg = 0;
@@ -369,6 +376,258 @@ static pthread_t zmq_thread;
 static int exiting = 0;
 
 __attribute__((unused)) static void dump_active_flows(time_t now_sec);
+
+/* ================================================================= */
+/*   Ground-truth per-flow packet counts + per-flow collision stats   */
+/*   + timing: first_ts_us, hit30_ts_us, last_ts_us                   */
+/* ================================================================= */
+#define GT_SIZE (1u << 22)
+
+typedef struct {
+  int in_use;
+  flow_key_t key;
+  uint32_t pkt_count;
+  uint32_t collisions;
+  uint32_t wins;
+  uint32_t losses;
+
+  uint64_t first_ts_us;
+  uint64_t hit30_ts_us;
+  uint64_t last_ts_us;
+} gt_entry_t;
+
+static gt_entry_t gt_tab[GT_SIZE];
+
+#if (GT_SIZE & (GT_SIZE - 1)) != 0
+#error "GT_SIZE must be a power of two"
+#endif
+
+static inline uint64_t tv_to_us(const struct timeval *tv) {
+  return (uint64_t)tv->tv_sec * 1000000ull + (uint64_t)tv->tv_usec;
+}
+
+static inline uint32_t hash_flow_key32(const flow_key_t *k) {
+  uint32_t h = 2166136261u;
+  h ^= (uint32_t)k->ip1;
+  h *= 16777619u;
+  h ^= (uint32_t)k->ip2;
+  h *= 16777619u;
+  h ^= (uint32_t)k->port1;
+  h *= 16777619u;
+  h ^= (uint32_t)k->port2;
+  h *= 16777619u;
+  h ^= (uint32_t)k->proto;
+  h *= 16777619u;
+  return h;
+}
+
+static inline int compare_key(const flow_key_t *a, const flow_key_t *b) {
+  return !(a->ip1 == b->ip1 && a->ip2 == b->ip2 && a->port1 == b->port1 && a->port2 == b->port2 &&
+           a->proto == b->proto);
+}
+
+static gt_entry_t *gt_get_or_insert(const flow_key_t *k) {
+  uint32_t mask = (uint32_t)(GT_SIZE - 1u);
+  uint32_t i = hash_flow_key32(k) & mask;
+
+  for (uint32_t step = 0; step < GT_SIZE; step++) {
+    gt_entry_t *e = &gt_tab[i];
+    if (!e->in_use) {
+      e->in_use = 1;
+      e->key = *k;
+      e->pkt_count = 0;
+      e->collisions = 0;
+      e->wins = 0;
+      e->losses = 0;
+      e->first_ts_us = 0;
+      e->hit30_ts_us = 0;
+      e->last_ts_us = 0;
+      return e;
+    }
+    if (!compare_key(&e->key, k))
+      return e;
+    i = (i + 1u) & mask;
+  }
+  return NULL;
+}
+
+/* Ground-truth per-packet update (counts ALL packets regardless of gating). */
+static inline void gt_count_packet_tv(const flow_key_t *k, const struct timeval *tv) {
+  gt_entry_t *e = gt_get_or_insert(k);
+  if (!e)
+    return;
+
+  uint64_t t = tv_to_us(tv);
+  if (e->first_ts_us == 0)
+    e->first_ts_us = t;
+
+  e->pkt_count++;
+
+  if (e->pkt_count == 30 && e->hit30_ts_us == 0)
+    e->hit30_ts_us = t;
+
+  e->last_ts_us = t;
+}
+
+static inline uint32_t gt_get_pkt_count(const flow_key_t *k) {
+  uint32_t mask = (uint32_t)(GT_SIZE - 1u);
+  uint32_t i = hash_flow_key32(k) & mask;
+
+  for (uint32_t step = 0; step < GT_SIZE; step++) {
+    gt_entry_t *e = &gt_tab[i];
+    if (!e->in_use)
+      return 0;
+    if (!compare_key(&e->key, k))
+      return e->pkt_count;
+    i = (i + 1u) & mask;
+  }
+  return 0;
+}
+
+static inline void gt_note_collision(const flow_key_t *winner, const flow_key_t *loser) {
+  gt_entry_t *w = gt_get_or_insert(winner);
+  gt_entry_t *l = gt_get_or_insert(loser);
+  if (w) {
+    w->collisions++;
+    w->wins++;
+  }
+  if (l) {
+    l->collisions++;
+    l->losses++;
+  }
+}
+
+/* ================================================================= */
+/*                    Collision event logging (.bin)                  */
+/* ================================================================= */
+typedef struct {
+  flow_key_t winner;
+  flow_key_t loser;
+  uint8_t winner_was_incumbent; /* 1 if winner was main at duel time */
+  uint64_t ts_us;
+} collision_rec_t;
+
+static FILE *g_colbin = NULL;
+
+static inline void ip_to_str(uint32_t ip, char out[INET_ADDRSTRLEN]) {
+  inet_ntop(AF_INET, &ip, out, INET_ADDRSTRLEN);
+}
+
+static inline void log_collision_event(const struct timeval *tv, const flow_key_t *winner, const flow_key_t *loser,
+                                       int winner_was_incumbent) {
+  if (!g_colbin)
+    return;
+
+  collision_rec_t r;
+  r.winner = *winner;
+  r.loser = *loser;
+  r.winner_was_incumbent = (uint8_t)(winner_was_incumbent ? 1 : 0);
+  r.ts_us = tv_to_us(tv);
+
+  (void)fwrite(&r, sizeof(r), 1, g_colbin);
+  gt_note_collision(winner, loser);
+}
+
+static void write_collisions_csv_from_bin(const char *bin_path, const char *csv_path) {
+  FILE *in = fopen(bin_path, "rb");
+  if (!in) {
+    perror("fopen collisions.bin");
+    return;
+  }
+
+  FILE *out = fopen(csv_path, "w");
+  if (!out) {
+    perror("fopen collisions.csv");
+    fclose(in);
+    return;
+  }
+
+  fprintf(out,
+          "ts_us,"
+          "winner_ip1,winner_port1,winner_ip2,winner_port2,winner_proto,"
+          "loser_ip1,loser_port1,loser_ip2,loser_port2,loser_proto,"
+          "winner_was_incumbent,"
+          "winner_pkts,loser_pkts,"
+          "winner_ge40,loser_ge40\n");
+
+  collision_rec_t r;
+  while (fread(&r, sizeof(r), 1, in) == 1) {
+    char wip1[INET_ADDRSTRLEN], wip2[INET_ADDRSTRLEN];
+    char lip1[INET_ADDRSTRLEN], lip2[INET_ADDRSTRLEN];
+    ip_to_str(r.winner.ip1, wip1);
+    ip_to_str(r.winner.ip2, wip2);
+    ip_to_str(r.loser.ip1, lip1);
+    ip_to_str(r.loser.ip2, lip2);
+
+    uint32_t wp = gt_get_pkt_count(&r.winner);
+    uint32_t lp = gt_get_pkt_count(&r.loser);
+
+    int w_ge = (wp >= FLOW_CAP);
+    int l_ge = (lp >= FLOW_CAP);
+
+    fprintf(out,
+            "%" PRIu64 ","
+            "%s,%u,%s,%u,%s,"
+            "%s,%u,%s,%u,%s,"
+            "%u,"
+            "%u,%u,"
+            "%d,%d\n",
+            r.ts_us, wip1, (unsigned)r.winner.port1, wip2, (unsigned)r.winner.port2,
+            (r.winner.proto == IPPROTO_UDP ? "UDP" : "TCP"), lip1, (unsigned)r.loser.port1, lip2,
+            (unsigned)r.loser.port2, (r.loser.proto == IPPROTO_UDP ? "UDP" : "TCP"),
+            (unsigned)r.winner_was_incumbent, (unsigned)wp, (unsigned)lp, w_ge, l_ge);
+  }
+
+  fclose(out);
+  fclose(in);
+}
+
+static void write_flow_collision_summary_csv(const char *csv_path) {
+  FILE *out = fopen(csv_path, "w");
+  if (!out) {
+    perror("fopen flow_collision_summary.csv");
+    return;
+  }
+
+  fprintf(out,
+          "ip1,port1,ip2,port2,proto,"
+          "pkts,ge40,collisions,wins,losses,"
+          "first_ts_us,hit30_ts_us,last_ts_us,"
+          "dur_to_30_us,dur_30_to_last_us,dur_total_us\n");
+
+  for (uint32_t i = 0; i < GT_SIZE; i++) {
+    gt_entry_t *e = &gt_tab[i];
+    if (!e->in_use)
+      continue;
+
+    char ip1[INET_ADDRSTRLEN], ip2[INET_ADDRSTRLEN];
+    ip_to_str(e->key.ip1, ip1);
+    ip_to_str(e->key.ip2, ip2);
+
+    uint64_t dur_to_30 = 0;
+    if (e->hit30_ts_us != 0 && e->first_ts_us != 0 && e->hit30_ts_us >= e->first_ts_us)
+      dur_to_30 = e->hit30_ts_us - e->first_ts_us;
+
+    uint64_t dur_30_to_last = 0;
+    if (e->hit30_ts_us != 0 && e->last_ts_us != 0 && e->last_ts_us >= e->hit30_ts_us)
+      dur_30_to_last = e->last_ts_us - e->hit30_ts_us;
+
+    uint64_t dur_total = 0;
+    if (e->last_ts_us != 0 && e->first_ts_us != 0 && e->last_ts_us >= e->first_ts_us)
+      dur_total = e->last_ts_us - e->first_ts_us;
+
+    fprintf(out,
+            "%s,%u,%s,%u,%s,"
+            "%u,%d,%u,%u,%u,"
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+            ip1, (unsigned)e->key.port1, ip2, (unsigned)e->key.port2, (e->key.proto == IPPROTO_UDP ? "UDP" : "TCP"),
+            (unsigned)e->pkt_count, (e->pkt_count >= FLOW_CAP) ? 1 : 0, (unsigned)e->collisions, (unsigned)e->wins,
+            (unsigned)e->losses, e->first_ts_us, e->hit30_ts_us, e->last_ts_us, dur_to_30, dur_30_to_last, dur_total);
+  }
+
+  fclose(out);
+}
 
 /* ================================================================= */
 /*                           Timing-wheel helpers                     */
@@ -531,11 +790,6 @@ static void *sender_thread(void *arg) {
 /* ================================================================= */
 /*                         helper functions                           */
 /* ================================================================= */
-static int compare_key(const flow_key_t *a, const flow_key_t *b) {
-  return !(a->ip1 == b->ip1 && a->ip2 == b->ip2 && a->port1 == b->port1 && a->port2 == b->port2 &&
-           a->proto == b->proto);
-}
-
 static flow_key_t make_key(uint32_t s_ip, uint32_t d_ip, uint16_t s_pt, uint16_t d_pt, uint8_t proto) {
   flow_key_t k;
   if (ntohl(s_ip) < ntohl(d_ip)) {
@@ -605,7 +859,7 @@ static void write_to_csv(flow_entry_t *e) {
     (void)snprintf(feature_vector + w, sizeof(feature_vector) - w, "]");
 
   const char *fname =
-      e->is_udp ? "flow_output_timing_wheel_with_prediction_udp.csv" : "flow_output_timing_wheel_with_prediction_tcp.csv";
+      e->is_udp ? "flow_output_timing_wheel_with_joblib_udp.csv" : "flow_output_timing_wheel_with_joblib_tcp.csv";
 
   FILE *f = fopen(fname, "a");
   if (!f) {
@@ -693,7 +947,8 @@ static void tw_advance(time_t now_sec) {
 
   time_t delta = now_sec - tw_now_sec;
   if (delta > 10) {
-    fprintf(stderr, "tw_advance: tw_now_sec=%ld now_sec=%ld delta=%ld\n", (long)tw_now_sec, (long)now_sec, (long)delta);
+    fprintf(stderr, "tw_advance: tw_now_sec=%ld now_sec=%ld delta=%ld\n", (long)tw_now_sec, (long)now_sec,
+            (long)delta);
   }
 
   if (delta >= TW_SLOTS) {
@@ -748,7 +1003,7 @@ static void stats_1d(const double *a, int n, double *out_mean, double *out_std, 
   *out_sum = sum;
 }
 
-/* Fill x[27] in the same order as training script:
+/* Order matches your Python training script:
  *  s1..s8, dt2..dt8, mean_size,std_size,min_size,max_size,sum_size,
  *  mean_dt,std_dt,min_dt,max_dt, span_8, pps_8, bps_8
  */
@@ -834,7 +1089,7 @@ static void reschedule_udp_if_needed(flow_entry_t *base, int *tw_head, flow_entr
   tw_insert_generic(base, tw_head, idx, now_sec + UDP_IDLE_SEC);
 }
 
-/* UPDATED: swap uses two indices (main vs aux). */
+/* swap uses two indices (main vs aux). */
 static void swap_main_aux_bucket_generic(flow_entry_t *main_base, flow_entry_t *aux_base, int *tw_head_main,
                                         int *tw_head_aux, uint32_t p_main, uint32_t p_aux, time_t now_sec) {
   flow_entry_t tmp = main_base[p_main];
@@ -853,9 +1108,11 @@ static void swap_main_aux_bucket_generic(flow_entry_t *main_base, flow_entry_t *
   st_swaps++;
 }
 
-/* UPDATED: duel uses two indices (main vs aux). */
+/* UPDATED signature: takes tv for logging ts_us */
 static void resolve_duel_bucket_generic(flow_entry_t *main_base, flow_entry_t *aux_base, int *tw_head_main,
-                                       int *tw_head_aux, uint32_t p_main, uint32_t p_aux, time_t now_sec) {
+                                       int *tw_head_aux, uint32_t p_main, uint32_t p_aux, const struct timeval *tv) {
+  time_t now_sec = tv->tv_sec;
+
   flow_entry_t *m = &main_base[p_main];
   flow_entry_t *a = &aux_base[p_aux];
   if (!m->in_use || !a->in_use)
@@ -865,6 +1122,7 @@ static void resolve_duel_bucket_generic(flow_entry_t *main_base, flow_entry_t *a
   if (!compare_key(&m->key, &a->key))
     return;
 
+  /* If aux has enough to be scored but main doesn't, prioritize aux */
   if (a->count >= FIRST_N && m->count < FIRST_N) {
     swap_main_aux_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, now_sec);
     return;
@@ -872,6 +1130,12 @@ static void resolve_duel_bucket_generic(flow_entry_t *main_base, flow_entry_t *a
 
   if (m->count >= FIRST_N && a->count >= FIRST_N) {
     st_duels++;
+    st_collisions++;
+    st_battles++;
+
+    /* snapshot keys for logging */
+    flow_key_t mkey = m->key;
+    flow_key_t akey = a->key;
 
     int m_keep = keep_yesno(m);
     int a_keep = keep_yesno(a);
@@ -885,10 +1149,20 @@ static void resolve_duel_bucket_generic(flow_entry_t *main_base, flow_entry_t *a
       keep_main = coinflip();
 
     if (!keep_main) {
-      swap_main_aux_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, now_sec);
+      /* aux wins */
       st_aux_wins++;
+      st_challenger_wins++;
+
+      log_collision_event(tv, &akey, &mkey, 0);
+
+      swap_main_aux_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, now_sec);
+
     } else {
+      /* main wins */
       st_main_wins++;
+      st_incumbent_wins++;
+
+      log_collision_event(tv, &mkey, &akey, 1);
     }
 
     /* drop loser (now in aux slot) */
@@ -947,6 +1221,9 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip, u
   tw_advance(tv->tv_sec);
 
   flow_key_t key = make_key(sip, dip, sport, dport, proto);
+
+  /* Ground truth always counts packets and updates timestamps */
+  gt_count_packet_tv(&key, tv);
 
   char kbuf[64];
   snprintf(kbuf, sizeof kbuf, "%08x%04x%08x%04x%02x", key.ip1, key.port1, key.ip2, key.port2, key.proto);
@@ -1049,7 +1326,7 @@ static void track_packet(const struct timeval *tv, uint32_t sip, uint32_t dip, u
 
   /* Duel only if both occupied and not same key */
   if (m->in_use && a->in_use && compare_key(&m->key, &a->key)) {
-    resolve_duel_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, tv->tv_sec);
+    resolve_duel_bucket_generic(main_base, aux_base, tw_head_main, tw_head_aux, p_main, p_aux, tv);
   }
 }
 
@@ -1148,7 +1425,7 @@ int main(int argc, char **argv) {
   }
   signal(SIGQUIT, on_sigquit);
 
-  /* Initialize Python + load joblib model */
+  /* init Python + load model */
   if (!ml_joblib_init(argv[2])) {
     fprintf(stderr, "ERROR: failed to init joblib model: %s\n", argv[2]);
     return 1;
@@ -1156,12 +1433,23 @@ int main(int argc, char **argv) {
 
   srand((unsigned)time(NULL));
   udp_bloom_clear();
+  memset(gt_tab, 0, sizeof(gt_tab));
+
+  /* open collision bin log */
+  g_colbin = fopen("joblib_two_tables_collisions.bin", "wb");
+  if (!g_colbin) {
+    perror("fopen joblib_two_tables_collisions.bin");
+    ml_joblib_shutdown();
+    return 1;
+  }
 
   char err[PCAP_ERRBUF_SIZE];
   fprintf(stderr, "main: starting\n");
   pcap_t *pc = pcap_open_offline(argv[1], err);
   if (!pc) {
     fprintf(stderr, "pcap_open: %s\n", err);
+    fclose(g_colbin);
+    g_colbin = NULL;
     ml_joblib_shutdown();
     return 1;
   }
@@ -1170,6 +1458,8 @@ int main(int argc, char **argv) {
   if (pthread_create(&zmq_thread, NULL, sender_thread, NULL) != 0) {
     perror("pthread_create");
     pcap_close(pc);
+    fclose(g_colbin);
+    g_colbin = NULL;
     ml_joblib_shutdown();
     return 1;
   }
@@ -1238,11 +1528,22 @@ int main(int argc, char **argv) {
           " aux_inserted=%" PRIu64 " aux_matched=%" PRIu64 " aux_third_dropped=%" PRIu64
           " pkts_tracked=%" PRIu64
           " duels=%" PRIu64 " swaps=%" PRIu64 " main_wins=%" PRIu64 " aux_wins=%" PRIu64
+          " collisions=%" PRIu64 " battles=%" PRIu64 " challenger_wins=%" PRIu64 " incumbent_wins=%" PRIu64
           " udp_bloom_refused=%" PRIu64 "\n",
           st_flows_inserted, st_flows_matched, st_aux_inserted, st_aux_matched, st_aux_third_dropped, st_packets_tracked,
-          st_duels, st_swaps, st_main_wins, st_aux_wins, st_udp_bloom_refused);
+          st_duels, st_swaps, st_main_wins, st_aux_wins, st_collisions, st_battles, st_challenger_wins,
+          st_incumbent_wins, st_udp_bloom_refused);
 
-  /* Shutdown Python */
+  /* close collision bin and write CSV outputs */
+  if (g_colbin) {
+    fclose(g_colbin);
+    g_colbin = NULL;
+  }
+
+  write_collisions_csv_from_bin("joblib_two_tables_collisions.bin", "joblib_two_tables_collisions.csv");
+  write_flow_collision_summary_csv("joblib_two_tables_flow_collision_summary.csv");
+
+  /* shutdown Python */
   ml_joblib_shutdown();
 
   return 0;
