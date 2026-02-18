@@ -333,6 +333,16 @@ def main():
 
     splitter = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=args.seed)
     train_idx, test_idx = next(splitter.split(X_df, y, groups=groups))
+    train_files = sorted(set(groups[train_idx]))
+    test_files = sorted(set(groups[test_idx]))
+
+    print("\n=== Files in TRAIN set ===")
+    for f in train_files:
+        print(f)
+
+    print("\n=== Files in TEST set ===")
+    for f in test_files:
+        print(f)
 
     X_train = X_df.iloc[train_idx].values
     y_train = y[train_idx]
