@@ -1170,4 +1170,80 @@ int main(int argc, char **argv) {
   if (pthread_create(&zmq_thread, NULL, sender_thread, NULL) != 0) {
     perror("pthread_create");
     pcap_close(pc);
-    ml_joblib_
+    ml_joblib_shutdown();
+    return 1;
+  }
+  fprintf(stderr, "main: sender thread created\n");
+
+  struct pcap_pkthdr *h;
+  const u_char *pkt;
+  int rc;
+  uint64_t iters = 0, pkts = 0, zeros = 0;
+
+  while ((rc = pcap_next_ex(pc, &h, &pkt)) >= 0) {
+    iters++;
+
+    if (rc == 0) {
+      zeros++;
+      if ((zeros % 100000ULL) == 0) {
+        fprintf(stderr, "pcap_next_ex: rc==0 zeros=%" PRIu64 " iters=%" PRIu64 "\n", zeros, iters);
+      }
+      continue;
+    }
+
+    pkts++;
+    if ((pkts % 10000ULL) == 0) {
+      fprintf(stderr, "pcap: pkts=%" PRIu64 " iters=%" PRIu64 " last_ts=%ld\n", pkts, iters, (long)h->ts.tv_sec);
+    }
+
+    parse_and_track(h, pkt);
+  }
+
+  if (rc == -1)
+    fprintf(stderr, "pcap error: %s\n", pcap_geterr(pc));
+  fprintf(stderr, "main: pcap loop done rc=%d\n", rc);
+
+  if (last_pcap_sec != 0) {
+    tw_advance(last_pcap_sec + UDP_IDLE_SEC + TW_SLOTS);
+  }
+
+  for (int i = 0; i < TABLE_SIZE; ++i) {
+    if (table_tcp[i].in_use)
+      dump_and_clear_main(&table_tcp[i]);
+    if (table_udp[i].in_use)
+      dump_and_clear_main(&table_udp[i]);
+  }
+
+  for (int i = 0; i < TCP_AUX_SIZE; ++i) {
+    if (aux_tcp[i].in_use)
+      drop_and_clear_aux(&aux_tcp[i]);
+  }
+  for (int i = 0; i < UDP_AUX_SIZE; ++i) {
+    if (aux_udp[i].in_use)
+      drop_and_clear_aux(&aux_udp[i]);
+  }
+
+  pthread_mutex_lock(&mtx);
+  exiting = 1;
+  pthread_cond_broadcast(&cond_full);
+  pthread_mutex_unlock(&mtx);
+
+  fprintf(stderr, "main: setting exiting=1 and joining sender (fill=%zu)\n", fill);
+  pthread_join(zmq_thread, NULL);
+
+  pcap_close(pc);
+
+  fprintf(stderr,
+          "stats: main_inserted=%" PRIu64 " main_matched=%" PRIu64
+          " aux_inserted=%" PRIu64 " aux_matched=%" PRIu64 " aux_third_dropped=%" PRIu64
+          " pkts_tracked=%" PRIu64
+          " duels=%" PRIu64 " swaps=%" PRIu64 " main_wins=%" PRIu64 " aux_wins=%" PRIu64
+          " udp_bloom_refused=%" PRIu64 "\n",
+          st_flows_inserted, st_flows_matched, st_aux_inserted, st_aux_matched, st_aux_third_dropped, st_packets_tracked,
+          st_duels, st_swaps, st_main_wins, st_aux_wins, st_udp_bloom_refused);
+
+  /* Shutdown Python */
+  ml_joblib_shutdown();
+
+  return 0;
+}
