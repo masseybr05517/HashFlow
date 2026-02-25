@@ -13,6 +13,13 @@
  *       3) ground-truth per-flow summary CSV:
  *            joblib_two_tables_flow_collision_summary.csv
  *
+ *  NEW (requested stats):
+ *   - Tracks:
+ *       (a) how many flows are sent to the classifier
+ *       (b) how many flows competed for a spot in the table
+ *       (c) how many winners eventually reached 40
+ *       (d) how many losers would eventually reach 40
+ *
  *  NEW usage:
  *     ./flowhash_with_joblib file.pcap model.joblib
  *
@@ -363,6 +370,14 @@ static volatile sig_atomic_t g_tw_now_arg = 0;
 static uint64_t st_predict_calls = 0;
 static uint64_t st_keep_calls = 0;
 
+/* --- NEW requested stats ------------------------------------------ */
+/* flows sent to the classifier */
+static uint64_t st_classify_calls_total = 0;  /* total keep_yesno calls */
+static uint64_t st_classify_flows_unique = 0; /* unique flow-keys ever classified */
+/* flows that competed for a spot (only real duels: both have FIRST_N) */
+static uint64_t st_flows_competed_total = 0;  /* counts flows, so +2 per duel */
+static uint64_t st_flows_competed_unique = 0; /* unique flow-keys that ever dueled */
+
 /* ---------- ZMQ batching ring buffer ------------------------------ */
 typedef struct {
   flow_entry_t slot;
@@ -394,6 +409,11 @@ typedef struct {
   uint64_t first_ts_us;
   uint64_t hit30_ts_us;
   uint64_t last_ts_us;
+
+  /* --- NEW: per-flow flags/counters for requested stats ---------- */
+  uint32_t classified_calls; /* how many times this key hit the classifier */
+  uint8_t classified_ever;   /* 1 once it's ever been classified */
+  uint8_t competed_ever;     /* 1 once it's ever participated in a duel */
 } gt_entry_t;
 
 static gt_entry_t gt_tab[GT_SIZE];
@@ -442,6 +462,9 @@ static gt_entry_t *gt_get_or_insert(const flow_key_t *k) {
       e->first_ts_us = 0;
       e->hit30_ts_us = 0;
       e->last_ts_us = 0;
+      e->classified_calls = 0;
+      e->classified_ever = 0;
+      e->competed_ever = 0;
       return e;
     }
     if (!compare_key(&e->key, k))
@@ -494,6 +517,28 @@ static inline void gt_note_collision(const flow_key_t *winner, const flow_key_t 
   if (l) {
     l->collisions++;
     l->losses++;
+  }
+}
+
+/* --- NEW: requested stats helpers -------------------------------- */
+static inline void gt_note_classified(const flow_key_t *k) {
+  gt_entry_t *e = gt_get_or_insert(k);
+  if (!e)
+    return;
+  e->classified_calls++;
+  if (!e->classified_ever) {
+    e->classified_ever = 1;
+    st_classify_flows_unique++;
+  }
+}
+
+static inline void gt_note_competed(const flow_key_t *k) {
+  gt_entry_t *e = gt_get_or_insert(k);
+  if (!e)
+    return;
+  if (!e->competed_ever) {
+    e->competed_ever = 1;
+    st_flows_competed_unique++;
   }
 }
 
@@ -1072,6 +1117,11 @@ static inline double score_reach40(const flow_entry_t *e) {
 
 static inline int keep_yesno(const flow_entry_t *e) {
   st_keep_calls++;
+
+  /* requested: count flows sent to classifier */
+  st_classify_calls_total++;
+  gt_note_classified(&e->key);
+
   double p = score_reach40(e);
   return (p >= EVICT_THRESHOLD);
 }
@@ -1136,6 +1186,11 @@ static void resolve_duel_bucket_generic(flow_entry_t *main_base, flow_entry_t *a
     /* snapshot keys for logging */
     flow_key_t mkey = m->key;
     flow_key_t akey = a->key;
+
+    /* requested: flows that competed for a spot in the table */
+    st_flows_competed_total += 2; /* two flows competed */
+    gt_note_competed(&mkey);
+    gt_note_competed(&akey);
 
     int m_keep = keep_yesno(m);
     int a_keep = keep_yesno(a);
@@ -1533,6 +1588,50 @@ int main(int argc, char **argv) {
           st_flows_inserted, st_flows_matched, st_aux_inserted, st_aux_matched, st_aux_third_dropped, st_packets_tracked,
           st_duels, st_swaps, st_main_wins, st_aux_wins, st_collisions, st_battles, st_challenger_wins,
           st_incumbent_wins, st_udp_bloom_refused);
+
+  /* -------------------------------------------------------------- */
+  /* requested summary stats based on ground-truth pkt_count         */
+  /* winners/losers are unique flows by key (wins>0 / losses>0).     */
+  /* -------------------------------------------------------------- */
+  uint64_t gt_winner_flows = 0, gt_winner_ge40 = 0;
+  uint64_t gt_loser_flows = 0, gt_loser_ge40 = 0;
+
+  for (uint32_t i = 0; i < GT_SIZE; i++) {
+    gt_entry_t *e = &gt_tab[i];
+    if (!e->in_use)
+      continue;
+    int ge40 = (e->pkt_count >= FLOW_CAP);
+    if (e->wins > 0) {
+      gt_winner_flows++;
+      if (ge40)
+        gt_winner_ge40++;
+    }
+    if (e->losses > 0) {
+      gt_loser_flows++;
+      if (ge40)
+        gt_loser_ge40++;
+    }
+  }
+
+  fprintf(stderr,
+          "requested_stats:"
+          " classify_calls_total=%" PRIu64
+          " classify_flows_unique=%" PRIu64
+          " competed_flows_total=%" PRIu64
+          " competed_flows_unique=%" PRIu64
+          " winner_flows_unique=%" PRIu64
+          " winner_flows_ge40=%" PRIu64
+          " loser_flows_unique=%" PRIu64
+          " loser_flows_ge40=%" PRIu64
+          "\n",
+          st_classify_calls_total,
+          st_classify_flows_unique,
+          st_flows_competed_total,
+          st_flows_competed_unique,
+          gt_winner_flows,
+          gt_winner_ge40,
+          gt_loser_flows,
+          gt_loser_ge40);
 
   /* close collision bin and write CSV outputs */
   if (g_colbin) {
