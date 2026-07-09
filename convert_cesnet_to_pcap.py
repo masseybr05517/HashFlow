@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-Convert CESNET-style flow CSV/TSV rows into synthetic PCAPs.
+Convert CESNET-style flow CSV rows into synthetic PCAPs.
+
+Supports:
+- IPv4
+- IPv6
+- TCP
+- UDP
 
 Important assumptions:
 - This creates synthetic PCAPs, not original traffic reconstruction.
@@ -29,13 +35,11 @@ import ipaddress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Tuple
 
-from scapy.all import Ether, IP, TCP, UDP, Raw, PcapWriter
+from scapy.all import Ether, IP, IPv6, TCP, UDP, Raw, PcapWriter
 
 
-# Use IANA dynamic/private port range.
-# This gives 16,384 possible generated source ports per PCAP.
 EPHEMERAL_MIN = 49152
 EPHEMERAL_MAX = 65535
 EPHEMERAL_COUNT = EPHEMERAL_MAX - EPHEMERAL_MIN + 1
@@ -49,6 +53,7 @@ class FlowState:
     src_port: int
     dst_port: int
     protocol: int
+    ip_version: int
 
     client_seq: int
     server_seq: int
@@ -58,18 +63,6 @@ class FlowState:
 
 
 class SourcePortAllocator:
-    """
-    Deterministically allocate a mostly-unique generated source port per flow.
-
-    Within a single output PCAP, this allocator avoids reusing the same source
-    port until the dynamic port range is exhausted. If you have more than 16,384
-    flows in one PCAP, source port reuse is unavoidable because TCP/UDP ports
-    are 16-bit.
-
-    Even if a source port repeats later, the 5-tuple can still remain unique
-    because SRC_IP, DST_IP, DST_PORT, and PROTOCOL may differ.
-    """
-
     def __init__(self) -> None:
         self.used_ports: set[int] = set()
         self.flow_to_port: Dict[str, int] = {}
@@ -87,7 +80,6 @@ class SourcePortAllocator:
                 self.flow_to_port[flow_key] = port
                 return port
 
-        # Port space exhausted. Reuse deterministically.
         port = start
         self.flow_to_port[flow_key] = port
         return port
@@ -105,23 +97,12 @@ def stable_u32(text: str) -> int:
 def mac_from_text(text: str) -> str:
     """
     Make a deterministic locally-administered unicast MAC address.
-
-    First byte 0x02 means locally administered and unicast.
     """
     h = hashlib.blake2b(text.encode("utf-8"), digest_size=5).digest()
     return "02:" + ":".join(f"{b:02x}" for b in h)
 
 
 def parse_time(value: str) -> float:
-    """
-    Parse CESNET ISO time into POSIX seconds.
-
-    CESNET values look like:
-        2022-01-10T22:00:00
-        2022-01-10T22:00:01.111462
-
-    If no timezone is present, treat as UTC for PCAP timestamps.
-    """
     value = value.strip()
     dt = datetime.fromisoformat(value)
 
@@ -132,29 +113,23 @@ def parse_time(value: str) -> float:
 
 
 def sniff_delimiter(path: Path) -> str:
-    """
-    Try to detect CSV vs TSV.
-
-    Your pasted sample is tab-separated. If the file is comma-separated, the PPI
-    column must be properly quoted because it contains commas.
-    """
-    sample = path.read_text(errors="replace")[:8192]
+    with path.open("r", errors="replace") as f:
+        sample = f.read(8192)
 
     try:
         dialect = csv.Sniffer().sniff(sample, delimiters="\t,;")
         return dialect.delimiter
     except csv.Error:
-        # CESNET examples like yours are often TSV-like.
-        return "\t"
+        return ","
 
 
-def parse_boolish(value: Optional[str]) -> bool:
+def parse_boolish(value) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
 
 
-def parse_int(value: str, default: int = 0) -> int:
+def parse_int(value, default: int = 0) -> int:
     try:
         return int(float(str(value).strip()))
     except Exception:
@@ -162,10 +137,6 @@ def parse_int(value: str, default: int = 0) -> int:
 
 
 def parse_ppi(value: str) -> Tuple[List[float], List[int], List[int], List[int]]:
-    """
-    Return:
-        ipt_ms, directions, payload_sizes, push_flags
-    """
     ppi = ast.literal_eval(value)
 
     if not isinstance(ppi, list) or len(ppi) < 3:
@@ -186,12 +157,6 @@ def parse_ppi(value: str) -> Tuple[List[float], List[int], List[int], List[int]]
 
 
 def make_flow_key(row: Dict[str, str]) -> str:
-    """
-    Use ID when available because it should be unique per CESNET flow.
-
-    Include 5-tuple-ish fields too so that if IDs collide across files, the
-    generated details are still reasonably stable.
-    """
     return "|".join(
         [
             str(row.get("ID", "")).strip(),
@@ -204,11 +169,19 @@ def make_flow_key(row: Dict[str, str]) -> str:
     )
 
 
-def valid_ipv4(ip: str) -> bool:
-    try:
-        return isinstance(ipaddress.ip_address(ip), ipaddress.IPv4Address)
-    except Exception:
-        return False
+def get_ip_version(src_ip: str, dst_ip: str) -> int:
+    """
+    Return 4 or 6.
+
+    Reject mixed IPv4/IPv6 rows.
+    """
+    src_obj = ipaddress.ip_address(src_ip)
+    dst_obj = ipaddress.ip_address(dst_ip)
+
+    if src_obj.version != dst_obj.version:
+        raise ValueError(f"Mixed IP versions are not supported: {src_ip} -> {dst_ip}")
+
+    return src_obj.version
 
 
 def build_flow_state(row: Dict[str, str], port_allocator: SourcePortAllocator) -> FlowState:
@@ -217,14 +190,18 @@ def build_flow_state(row: Dict[str, str], port_allocator: SourcePortAllocator) -
     src_ip = row["SRC_IP"].strip()
     dst_ip = row["DST_IP"].strip()
 
-    if not valid_ipv4(src_ip) or not valid_ipv4(dst_ip):
-        raise ValueError(f"Only IPv4 is handled by this script. Bad flow: {flow_key}")
+    ip_version = get_ip_version(src_ip, dst_ip)
 
     protocol = parse_int(row.get("PROTOCOL", "0"))
     dst_port = parse_int(row.get("DST_PORT", "0"))
 
     if not (0 < dst_port <= 65535):
-        dst_port = 443 if protocol == 6 else 53
+        if protocol == 6:
+            dst_port = 443
+        elif protocol == 17:
+            dst_port = 53
+        else:
+            dst_port = 0
 
     src_port = port_allocator.allocate(flow_key)
 
@@ -235,6 +212,7 @@ def build_flow_state(row: Dict[str, str], port_allocator: SourcePortAllocator) -
         src_port=src_port,
         dst_port=dst_port,
         protocol=protocol,
+        ip_version=ip_version,
         client_seq=stable_u32(flow_key + "|client_seq"),
         server_seq=stable_u32(flow_key + "|server_seq"),
         client_mac=mac_from_text(flow_key + "|client_mac"),
@@ -244,12 +222,6 @@ def build_flow_state(row: Dict[str, str], port_allocator: SourcePortAllocator) -
 
 
 def payload_bytes(flow_key: str, direction: int, size: int) -> bytes:
-    """
-    Deterministic fake payload.
-
-    Avoid using random bytes because deterministic output is helpful for
-    debugging and repeatability.
-    """
     if size <= 0:
         return b""
 
@@ -262,7 +234,14 @@ def payload_bytes(flow_key: str, direction: int, size: int) -> bytes:
     return (seed * repeats)[:size]
 
 
-def make_ip_layer(state: FlowState, direction: int) -> IP:
+def make_network_layer(state: FlowState, direction: int):
+    """
+    Create either an IPv4 or IPv6 layer depending on the flow.
+
+    direction:
+        +1 means SRC -> DST
+        -1 means DST -> SRC
+    """
     if direction == 1:
         src = state.src_ip
         dst = state.dst_ip
@@ -270,16 +249,21 @@ def make_ip_layer(state: FlowState, direction: int) -> IP:
         src = state.dst_ip
         dst = state.src_ip
 
-    ip = IP(src=src, dst=dst, id=state.ip_id, ttl=64)
-    state.ip_id = (state.ip_id + 1) % 65536
-    return ip
+    if state.ip_version == 4:
+        layer = IP(src=src, dst=dst, id=state.ip_id, ttl=64)
+        state.ip_id = (state.ip_id + 1) % 65536
+        return layer
+
+    if state.ip_version == 6:
+        return IPv6(src=src, dst=dst, hlim=64)
+
+    raise ValueError(f"Unsupported IP version: {state.ip_version}")
 
 
 def make_ether_layer(state: FlowState, direction: int) -> Ether:
     if direction == 1:
         return Ether(src=state.client_mac, dst=state.server_mac)
-    else:
-        return Ether(src=state.server_mac, dst=state.client_mac)
+    return Ether(src=state.server_mac, dst=state.client_mac)
 
 
 def make_tcp_packet(
@@ -289,12 +273,6 @@ def make_tcp_packet(
     payload_len: int,
     timestamp: float,
 ):
-    """
-    direction:
-        +1 means SRC -> DST
-        -1 means DST -> SRC
-    """
-
     if direction == 1:
         sport = state.src_port
         dport = state.dst_port
@@ -306,9 +284,16 @@ def make_tcp_packet(
         seq = state.server_seq
         ack = state.client_seq
 
-    tcp = TCP(sport=sport, dport=dport, flags=flags, seq=seq, ack=ack, window=8192)
+    tcp = TCP(
+        sport=sport,
+        dport=dport,
+        flags=flags,
+        seq=seq,
+        ack=ack,
+        window=8192,
+    )
 
-    pkt = make_ether_layer(state, direction) / make_ip_layer(state, direction) / tcp
+    pkt = make_ether_layer(state, direction) / make_network_layer(state, direction) / tcp
 
     if payload_len > 0:
         pkt = pkt / Raw(load=payload_bytes(state.flow_key, direction, payload_len))
@@ -316,12 +301,13 @@ def make_tcp_packet(
     pkt.time = timestamp
 
     seq_advance = payload_len
+
     if "S" in flags:
         seq_advance += 1
+
     if "F" in flags:
         seq_advance += 1
 
-    # RST does not consume sequence space in the same way for our purposes here.
     if direction == 1:
         state.client_seq = (state.client_seq + seq_advance) & 0xFFFFFFFF
     else:
@@ -345,7 +331,7 @@ def make_udp_packet(
 
     udp = UDP(sport=sport, dport=dport)
 
-    pkt = make_ether_layer(state, direction) / make_ip_layer(state, direction) / udp
+    pkt = make_ether_layer(state, direction) / make_network_layer(state, direction) / udp
 
     if payload_len > 0:
         pkt = pkt / Raw(load=payload_bytes(state.flow_key, direction, payload_len))
@@ -361,10 +347,6 @@ def generate_packets_for_row(
     teardown_gap_seconds: float = 0.001,
     respect_rst: bool = False,
 ):
-    """
-    Yield synthetic packets for one CESNET flow row.
-    """
-
     state = build_flow_state(row, port_allocator)
 
     ipt_ms, directions, payload_sizes, push_flags = parse_ppi(row["PPI"])
@@ -372,11 +354,17 @@ def generate_packets_for_row(
     t0 = parse_time(row["TIME_FIRST"])
 
     if state.protocol == 6:
-        # TCP opening.
-        #
-        # First packet from SRC direction has SYN.
-        # First packet from DST direction has SYN+ACK.
-        yield make_tcp_packet(state, direction=1, flags="S", payload_len=0, timestamp=t0)
+        # TCP synthetic handshake:
+        # SRC -> DST: SYN
+        # DST -> SRC: SYN+ACK
+        # SRC -> DST: ACK
+        yield make_tcp_packet(
+            state,
+            direction=1,
+            flags="S",
+            payload_len=0,
+            timestamp=t0,
+        )
 
         yield make_tcp_packet(
             state,
@@ -386,8 +374,6 @@ def generate_packets_for_row(
             timestamp=t0 + handshake_gap_seconds,
         )
 
-        # Client ACK completes the synthetic handshake.
-        # This is not the first packet from SRC direction; the first was SYN.
         yield make_tcp_packet(
             state,
             direction=1,
@@ -418,7 +404,6 @@ def generate_packets_for_row(
         flag_rst = parse_boolish(row.get("FLAG_RST")) or parse_boolish(row.get("FLAG_RST_REV"))
 
         if respect_rst and flag_rst:
-            # Optional: if the original row says RST happened, end with RST instead of FIN.
             yield make_tcp_packet(
                 state,
                 direction=1,
@@ -426,6 +411,7 @@ def generate_packets_for_row(
                 payload_len=0,
                 timestamp=current_time + teardown_gap_seconds,
             )
+
             yield make_tcp_packet(
                 state,
                 direction=-1,
@@ -433,15 +419,9 @@ def generate_packets_for_row(
                 payload_len=0,
                 timestamp=current_time + 2 * teardown_gap_seconds,
             )
+
         else:
-            # TCP teardown.
-            #
-            # Final packet from SRC direction has FIN.
-            # Final packet from DST direction has FIN.
-            #
-            # We intentionally do not add a final pure ACK after the server FIN,
-            # because then the final SRC-direction packet would not have FIN,
-            # violating your requested invariant.
+            # Final packet from each direction has FIN.
             yield make_tcp_packet(
                 state,
                 direction=1,
@@ -449,6 +429,7 @@ def generate_packets_for_row(
                 payload_len=0,
                 timestamp=current_time + teardown_gap_seconds,
             )
+
             yield make_tcp_packet(
                 state,
                 direction=-1,
@@ -458,7 +439,6 @@ def generate_packets_for_row(
             )
 
     elif state.protocol == 17:
-        # UDP has no SYN/FIN.
         current_time = t0
 
         for ipt, direction, size in zip(ipt_ms, directions, payload_sizes):
@@ -475,7 +455,6 @@ def generate_packets_for_row(
             )
 
     else:
-        # Skip unsupported protocols.
         return
 
 
@@ -486,13 +465,15 @@ def read_rows(path: Path) -> Iterable[Dict[str, str]]:
         reader = csv.DictReader(f, delimiter=delimiter)
 
         for row in reader:
-            # Skip empty/broken rows.
             if not row:
                 continue
+
             if "PPI" not in row or not row.get("PPI"):
                 continue
+
             if "SRC_IP" not in row or "DST_IP" not in row:
                 continue
+
             yield row
 
 
@@ -502,11 +483,6 @@ def convert_file(
     sort_packets: bool = True,
     respect_rst: bool = False,
 ) -> Tuple[int, int]:
-    """
-    Returns:
-        flows_written, packets_written
-    """
-
     port_allocator = SourcePortAllocator()
 
     flows_written = 0
@@ -535,6 +511,7 @@ def convert_file(
         all_packets.sort(key=lambda pkt: float(pkt.time))
 
         writer = PcapWriter(str(output_path), linktype=1, sync=True)
+
         try:
             for pkt in all_packets:
                 writer.write(pkt)
@@ -543,9 +520,8 @@ def convert_file(
             writer.close()
 
     else:
-        # Streaming mode uses less memory, but assumes the input rows are already
-        # in roughly chronological order.
         writer = PcapWriter(str(output_path), linktype=1, sync=True)
+
         try:
             for row in read_rows(input_path):
                 try:
@@ -574,13 +550,13 @@ def convert_file(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert CESNET-style CSV/TSV flow rows into synthetic PCAP files."
+        description="Convert CESNET-style CSV flow rows into synthetic IPv4/IPv6 PCAP files."
     )
 
     parser.add_argument(
         "inputs",
         nargs="+",
-        help="Input CESNET CSV/TSV files.",
+        help="Input CESNET CSV files.",
     )
 
     parser.add_argument(
